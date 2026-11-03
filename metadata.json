@@ -1,0 +1,6 @@
+{
+  "name": "Myraa AI Assistant",
+  "description": "Myraa is a real-time, voice-to-voice AI assistant web application featuring ultra-low latency, natural conversation, and tool calling.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
