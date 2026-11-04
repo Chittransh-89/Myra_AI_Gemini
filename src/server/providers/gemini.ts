@@ -45,16 +45,31 @@ function toGeminiTools(declarations: ToolDeclaration[]) {
   return [{ functionDeclarations }];
 }
 
+function convertProperty(val: any): Record<string, unknown> {
+  const geminiType = mapType(val.type);
+  const prop: Record<string, unknown> = { type: geminiType };
+  if (val.description) prop.description = val.description;
+  if (val.enum) prop.enum = val.enum;
+  if (val.items) {
+    prop.items = convertProperty(val.items);
+  }
+  if (val.properties) {
+    const nested: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(val.properties)) {
+      nested[k] = convertProperty(v);
+    }
+    prop.properties = nested;
+  }
+  if (val.required) prop.required = val.required;
+  return prop;
+}
+
 function convertParameters(schema: ToolParameterSchema): Record<string, unknown> {
   const props: Record<string, unknown> = {};
 
   if (schema.properties) {
     for (const [key, val] of Object.entries(schema.properties)) {
-      const geminiType = mapType(val.type);
-      const prop: Record<string, unknown> = { type: geminiType };
-      if (val.description) prop.description = val.description;
-      if (val.enum) prop.enum = val.enum;
-      props[key] = prop;
+      props[key] = convertProperty(val);
     }
   }
 

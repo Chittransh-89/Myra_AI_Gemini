@@ -9,6 +9,7 @@
     "build": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs",
     "start": "node dist/server.cjs",
     "clean": "rm -rf dist server.js",
+    "test": "node test/vscodeProjectBuilder.test.cjs && node test/handoffAuthorityProject.test.cjs && node test/testActualVsCodeCreation.cjs",
     "lint": "tsc --noEmit",
     "electron:dev": "electron .",
     "electron:start": "npm run build && electron .",

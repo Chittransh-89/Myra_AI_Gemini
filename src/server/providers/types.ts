@@ -24,6 +24,9 @@ export interface ToolPropertySchema {
   type: PropertyType;
   description?: string;
   enum?: string[];
+  items?: ToolPropertySchema;
+  properties?: Record<string, ToolPropertySchema>;
+  required?: string[];
 }
 
 export interface ToolParameterSchema {

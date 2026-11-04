@@ -37,7 +37,12 @@ const {
 } = require("./ipcValidate.cjs");
 
 const DEFAULT_TICKET_TTL_MS = 20000;
-const EXECUTOR_NAMES = new Set(["getSystemTime", "openWebsite"]); // T5.0: declared builtin names only
+// Phase C: openWebsite is now MAIN-EXECUTED (validated navigation inside the
+// controlled Myra browser) and browserControl drives YouTube/page actions.
+// Both are declared builtin names; nothing else may be registered.
+// WhatsApp and Phone Link joined later: both are main-executed so no renderer
+// code ever authors a Gemini-visible messaging result.
+const EXECUTOR_NAMES = new Set(["getSystemTime", "openWebsite", "browserControl", "whatsappControl", "phoneControl", "projectControl"]);
 const MAX_RESULT_BYTES = 8 * 1024;          // canonical result cap (receipt)
 const MAX_PENDING_PER_CHANNEL = 64;         // concurrent registrations per pipe channel
 
@@ -64,7 +69,7 @@ function toPipePath(name) {
   return name.startsWith("\\\\.\\pipe\\") || name.startsWith("\\\\?\\pipe\\") ? name : "\\\\.\\pipe\\" + name;
 }
 
-function createHandoffAuthority({ audit, killSwitch, receiptKey, emitCompletion, notifyExecuting }) {
+function createHandoffAuthority({ audit, killSwitch, receiptKey, emitCompletion, notifyExecuting, browser, whatsapp, phone, project }) {
   const hmacKey = crypto.randomBytes(32); // ticket key — never leaves this process, never logged
   if (!Buffer.isBuffer(receiptKey) || receiptKey.length === 0) {
     throw new Error("createHandoffAuthority: receiptKey (Buffer) is required for completion signing");
@@ -74,10 +79,7 @@ function createHandoffAuthority({ audit, killSwitch, receiptKey, emitCompletion,
 
   const pending = new Map(); // callId -> entry
   const executors = new Map([
-    // T5.0: desktop executors intentionally DISABLED. getSystemTime is the
-    // single end-to-end validation tool executed in the unprivileged main
-    // process (harmless local clock read, same shape the renderer produced
-    // before this change).
+    // Harmless local clock read (end-to-end validation tool).
     [
       "getSystemTime",
       () => {
@@ -91,6 +93,48 @@ function createHandoffAuthority({ audit, killSwitch, receiptKey, emitCompletion,
       },
     ],
   ]);
+
+  // Phase C desktop executors. They exist ONLY when a browser controller was
+  // injected, so a mis-configured main process fails closed (registration is
+  // rejected as unknownToolName => the server synthesizes an error) instead of
+  // advertising a capability it cannot honour.
+  if (browser && typeof browser.open === "function") {
+    executors.set("openWebsite", (args) => browser.open(args && args.url));
+  }
+  if (browser && typeof browser.run === "function") {
+    executors.set("browserControl", (args) => browser.run(args));
+  }
+  // Messaging bridges. Same rule: only registered when the capability exists.
+  if (whatsapp && typeof whatsapp.status === "function") {
+    executors.set("whatsappControl", (args) => {
+      const action = args && args.action;
+      if (action === "status") return whatsapp.status();
+      if (action === "prepare") return whatsapp.prepare(args);
+      if (action === "send") return whatsapp.send(args);
+      return { ok: false, sent: false, error: "unsupportedAction" };
+    });
+  }
+  if (phone && typeof phone.status === "function") {
+    executors.set("phoneControl", (args) => {
+      const action = args && args.action;
+      if (action === "status") return phone.status();
+      if (action === "open") return phone.open();
+      return { ok: false, error: "unsupportedAction" };
+    });
+  }
+  // VS Code project builder. Filesystem work stays in main; the renderer only
+  // triggers it. Every apply is bound to a planId minted by plan().
+  if (project && typeof project.plan === "function") {
+    executors.set("projectControl", (args) => {
+      const action = args && args.action;
+      if (action === "detect") return project.detect();
+      if (action === "reference") return project.reference(args);
+      if (action === "plan") return project.plan(args);
+      if (action === "apply") return project.apply(args);
+      if (action === "edit") return project.edit(args);
+      return { ok: false, error: "unsupportedAction" };
+    });
+  }
   let generation = 0; // bumped by the kill switch; stale async completions are suppressed
   const stats = {
     registered: 0, consumed: 0, denied: 0, deniedByReason: {},

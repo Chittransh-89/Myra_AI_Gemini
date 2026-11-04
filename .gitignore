@@ -30,3 +30,5 @@ desktop.ini
 # --- Editor / IDE ---
 .vscode/
 .idea/
+.cloud-attachments/
+.freebuff/

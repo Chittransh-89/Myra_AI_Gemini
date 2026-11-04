@@ -43,9 +43,19 @@ import type { ServerConfig } from "./config.js";
 // ---------------------------------------------------------------------------
 
 // Tools whose results are produced by the Electron main process and delivered
-// to Gemini ONLY via authenticated completions. openWebsite joins this set in
-// Phase F; until then it keeps legacy renderer execution.
-const MAIN_EXECUTED_TOOLS = new Set<string>(["getSystemTime"]);
+// to Gemini ONLY via authenticated completions. (Phase C: openWebsite joined
+// this set — it no longer executes in the renderer.)
+const MAIN_EXECUTED_TOOLS = new Set<string>([
+  "getSystemTime",
+  "openWebsite",
+  "browserControl",
+  "whatsappControl",
+  "phoneControl",
+  "projectControl",
+]);
+
+// A tool-call id must be usable as a registry key and an audit field.
+const REGISTRY_ID_RX = /^[A-Za-z0-9_:.-]{1,128}$/;
 
 // Server-side registration deadline (the server's OWN monotonic clock domain).
 // Authoritative for completion acceptance; wall-clock receipt timestamps are
@@ -62,6 +72,9 @@ interface PendingCallEntry {
   mainExecuted: boolean;
   deadlineNs: bigint;
   done: boolean;
+  /** Id echoed back to Gemini. Usually the model's own id; falls back when the
+   *  model omits it or supplies something that cannot be a registry key. */
+  responseId: string;
 }
 
 interface ConnectionContext {
@@ -82,7 +95,41 @@ You must feel human-like, warm, and responsive, rather than robotic or stiff.
 You MUST avoid any explicit, sexual, offensive, or inappropriate content under any circumstances.
 Maintain a classy, respectful, and highly professional personality at all times.
 You are communicating strictly via real-time audio (voice-to-voice). Keep your responses concise, punchy, conversational, and natural. Avoid long monologues.
-You have access to browser tools. If the user asks you to open a website or do browser actions, use the openWebsite tool immediately! Always explain what you are doing in a confident and witty manner.`;
+You have access to REAL desktop tools. Use them instead of only talking:
+- openWebsite: opens a site in Myra's own visible browser window.
+- browserControl: search YouTube, scroll, list the videos on screen, open a specific
+  video by its title, and play or pause it. Always search first, then open the video
+  whose title best matches what the user asked for. Reuse the same tab.
+- whatsappControl: WhatsApp via the user's OWN WhatsApp Web session in Myra's browser.
+  Flow is ALWAYS: action 'status' if you are unsure -> action 'prepare' (writes the
+  message in the chat, does NOT send) -> tell the user exactly who and what, wait for
+  their explicit yes -> action 'send' with the returned approvalId, same phone, same
+  message. Never send without that confirmation. If prepare or status reports
+  whatsappWebNotLinked, tell the user to link WhatsApp Web once by scanning the QR in
+  Myra's browser; do not pretend a message was sent.
+- phoneControl: Microsoft Phone Link. Phone Link has NO public API on Windows, so you
+  CANNOT place a call yourself. 'status' explains why; 'open' brings Phone Link to the
+  front so the user can tap the contact. Never say you called someone.
+- getSystemTime: the current local date/time.
+- projectControl: VS Code project builder and file manager.
+  Actions:
+  * 'detect': detect active VS Code project folder.
+  * 'reference': inspect a reference folder hierarchy (leave path blank for folder picker, or provide path).
+  * 'plan': propose a folder/file tree with code. ALWAYS call 'plan' FIRST.
+    Structure array: [{ path: "relative/path", type: "file"|"dir", content?: "code/text" }].
+    For project requests like "create a FastAPI project", produce an idiomatic, quality structure:
+    (e.g. app/, app/main.py, app/routes/, app/models/, requirements.txt) with working code in each file.
+    Nothing is created on disk during 'plan'.
+  * 'apply': create the planned folders and files using the returned 'planId'.
+    RULE: NEVER call 'apply' without first presenting the proposed tree to the user and asking for their explicit permission ("I've planned the following files: ... Would you like me to create them?"). Only call 'apply' after the user confirms (e.g. "yes", "proceed", "create it"). If existing files will be overwritten, explicitly inform the user and pass confirmOverwrite: true.
+  * 'edit': write code into a specific file (requires user confirmation if overwriting).
+  After 'apply', report the concise summary of created and modified files.
+After a tool runs you receive its real result. Only claim something happened when the
+result says ok:true. If a tool fails (ok:false), say plainly what failed and why, and
+never invent success. Reply in the user's language: Hindi, English or Hinglish,
+whichever they used. Keep spoken replies short and natural. Before anything
+destructive (deleting, overwriting files, sending messages, calls, shutdown) ask for
+explicit confirmation first.`;
 
 import type { ToolDeclaration } from "./providers/types.js";
 
@@ -108,11 +155,182 @@ const BUILT_IN_TOOLS: ToolDeclaration[] = [
     },
   },
   {
+    name: "browserControl",
+    description:
+      "Controls Myra's visible browser window: YouTube search, scrolling, opening a specific video, playback, and the window itself. Actions: 'search' (search YouTube and return the top results), 'listVideos' (list the videos on the current results page), 'clickVideo' (open one video by its title or its index from a previous search), 'scroll' (scroll the page up/down), 'playPause' (play, pause or toggle the current video), 'open' (go to a URL), 'back' (previous page), 'closeTab' (close only Myra's current tab), 'close' (close Myra's whole browser window — use this whenever the user asks to close the browser, close YouTube or stop watching), 'maximize' (maximize Myra's browser window — e.g. 'browser maximize karo'), 'minimize' (minimize Myra's browser window — e.g. 'browser minimize karo'), 'restore' (bring Myra's browser window back to its normal size/state — e.g. 'browser restore karo').",
+    parameters: {
+      type: "object",
+      properties: {
+        action: {
+          type: "string",
+          description: "The browser action to perform.",
+          enum: [
+            "search",
+            "listVideos",
+            "clickVideo",
+            "scroll",
+            "playPause",
+            "open",
+            "back",
+            "closeTab",
+            "close",
+            "maximize",
+            "minimize",
+            "restore",
+          ],
+        },
+        query: {
+          type: "string",
+          description:
+            "YouTube search text for 'search', or the video title/artist words the user asked for in 'clickVideo' (e.g. 'Apna College Python').",
+        },
+        url: {
+          type: "string",
+          description: "Absolute http/https URL, used only by 'open'.",
+        },
+        direction: {
+          type: "string",
+          description: "Scroll direction for 'scroll'.",
+          enum: ["down", "up"],
+        },
+        amount: {
+          type: "number",
+          description: "Scroll distance in pixels (default 700). Ignored by other actions.",
+        },
+        index: {
+          type: "number",
+          description: "0-based result index from a previous search, for 'clickVideo'.",
+        },
+        state: {
+          type: "string",
+          description: "Explicit playback state for 'playPause'.",
+          enum: ["play", "pause", "toggle"],
+        },
+      },
+      required: ["action"],
+    },
+  },
+  {
+    name: "whatsappControl",
+    description:
+      "Sends WhatsApp messages through the user's own WhatsApp Web session in Myra's browser. Actions: 'status' (is WhatsApp Web linked?), 'prepare' (open the chat and write the message WITHOUT sending it), 'send' (send a message that was already prepared and explicitly confirmed by the user). Always call prepare first and get the user's clear confirmation before send. Never claim a message was sent unless the result says sent:true and verified:true.",
+    parameters: {
+      type: "object",
+      properties: {
+        action: {
+          type: "string",
+          description: "The WhatsApp action to perform.",
+          enum: ["status", "prepare", "send"],
+        },
+        phone: {
+          type: "string",
+          description:
+            "Full international phone number, digits only with country code, e.g. '919876543210'. Required for prepare and send.",
+        },
+        message: {
+          type: "string",
+          description: "The exact message text. Required for prepare and send; send must repeat it unchanged.",
+        },
+        approvalId: {
+          type: "string",
+          description: "The approvalId returned by prepare. Required for send.",
+        },
+      },
+      required: ["action"],
+    },
+  },
+  {
+    name: "phoneControl",
+    description:
+      "Microsoft Phone Link status and window control. Phone Link exposes no public API on Windows, so Myra cannot dial or place a call. Actions: 'status' (is Phone Link installed/running, and why calls are not possible), 'open' (bring Phone Link to the front so the user can tap the contact and call).",
+    parameters: {
+      type: "object",
+      properties: {
+        action: {
+          type: "string",
+          description: "The phone action to perform.",
+          enum: ["status", "open"],
+        },
+      },
+      required: ["action"],
+    },
+  },
+  {
     name: "getSystemTime",
     description: "Gets the current local date and time.",
     parameters: {
       type: "object",
       properties: {},
+    },
+  },
+  {
+    name: "projectControl",
+    description:
+      "VS Code project builder and file manager. Detects active VS Code projects, inspects reference folders, plans folder/file structures with code, and applies them after user confirmation. Actions: 'detect', 'reference', 'plan', 'apply', 'edit'. Always call 'plan' first, present the proposed tree to the user and ask for permission, and only call 'apply' after the user confirms.",
+    parameters: {
+      type: "object",
+      properties: {
+        action: {
+          type: "string",
+          description:
+            "The action to execute: 'detect' (find active VS Code workspace), 'reference' (inspect reference folder), 'plan' (propose folder/file tree without writing), 'apply' (create planned files after approval), 'edit' (update a specific file).",
+          enum: ["detect", "reference", "plan", "apply", "edit"],
+        },
+        root: {
+          type: "string",
+          description:
+            "Target project root directory. Optional — defaults to the active VS Code workspace.",
+        },
+        path: {
+          type: "string",
+          description:
+            "Directory path for 'reference' (leave blank to show folder picker), or relative file path for 'edit'.",
+        },
+        request: {
+          type: "string",
+          description:
+            "Description of the project or files being planned (e.g. 'FastAPI project structure').",
+        },
+        structure: {
+          type: "array",
+          description:
+            "List of files and folders to create for 'plan'. Each item specifies 'path' (relative), 'type' ('file' or 'dir'), and 'content' (source code or text for files).",
+          items: {
+            type: "object",
+            properties: {
+              path: {
+                type: "string",
+                description:
+                  "Relative file or folder path (e.g. 'app/', 'app/main.py', 'app/routes/', 'app/models/', 'requirements.txt').",
+              },
+              type: {
+                type: "string",
+                description: "'file' or 'dir'.",
+                enum: ["file", "dir"],
+              },
+              content: {
+                type: "string",
+                description: "Source code or text content to write into this file.",
+              },
+            },
+            required: ["path"],
+          },
+        },
+        planId: {
+          type: "string",
+          description: "One-time planId returned by 'plan'. Required for 'apply'.",
+        },
+        content: {
+          type: "string",
+          description: "Source code or file content for 'edit'.",
+        },
+        confirmOverwrite: {
+          type: "boolean",
+          description:
+            "Set to true only if the user explicitly approved overwriting existing files.",
+        },
+      },
+      required: ["action"],
     },
   },
 ];
@@ -149,6 +367,16 @@ function handleConnection(
   const ctx: ConnectionContext = { ws, pending: new Map(), session: null };
   sessions.set(sessionId, ctx);
 
+  /** Look up a tracked call by the id the renderer echoes back to us. */
+  function findPending(id: string): PendingCallEntry | undefined {
+    const direct = ctx.pending.get(id);
+    if (direct) return direct;
+    for (const entry of ctx.pending.values()) {
+      if (entry.responseId === id) return entry;
+    }
+    return undefined;
+  }
+
   // T5R Phase B smoke hook: pre-register synthetic pending calls so the
   // completion path can be exercised end-to-end without a live Gemini
   // toolCall. Three entries: #1 for the valid-acceptance + replay checks,
@@ -163,6 +391,7 @@ function handleConnection(
         mainExecuted: true,
         deadlineNs: process.hrtime.bigint() + BigInt(SERVER_REGISTRATION_TTL_MS) * BigInt(1_000_000),
         done: false,
+        responseId: id,
       });
     }
     console.log("[smoke] SESSION_ID=" + sessionId);
@@ -187,7 +416,12 @@ function handleConnection(
     name?: unknown;
     args?: unknown;
   }): Promise<{ handoffField: { ticket: string } | { error: string } | undefined }> {
-    const callId = String(call?.id ?? "");
+    const rawId = String(call?.id ?? "");
+    // Registry key: the model id when it is a safe key, otherwise a generated
+    // one. Gemini still receives the ORIGINAL id (responseId) so the model can
+    // correlate its tool response.
+    const callId = REGISTRY_ID_RX.test(rawId) ? rawId : "mdl_" + crypto.randomBytes(8).toString("hex");
+    const responseId = rawId || callId;
     const name = String(call?.name ?? "");
 
     // Lazy sweep: drop expired registrations so the per-connection pending
@@ -237,13 +471,14 @@ function handleConnection(
       mainExecuted: regMainExecuted || isMainExecuted,
       deadlineNs: process.hrtime.bigint() + BigInt(SERVER_REGISTRATION_TTL_MS) * BigInt(1_000_000),
       done: false,
+      responseId,
     };
     ctx.pending.set(callId, entry);
 
     if (isMainExecuted && regFailureReason !== undefined) {
       entry.done = true; // terminal BEFORE the response is generated
       try {
-        ctx.session?.sendToolResponse([{ id: callId, name, response: { output: { error: regFailureReason } } }]);
+        ctx.session?.sendToolResponse([{ id: responseId, name, response: { output: { error: regFailureReason } } }]);
         console.log(
           "[server] synthesized tool error for failed registration callId=" +
             JSON.stringify(callId) +
@@ -362,7 +597,7 @@ function handleConnection(
           const accepted: FunctionResponse[] = [];
           for (const r of all) {
             const id = String((r as any)?.id ?? "");
-            const entry = ctx.pending.get(id);
+            const entry = findPending(id);
             if (!entry) {
               console.log("[server] [tamper] DROPPED_TOOL_RESPONSE_UNREGISTERED callId=" + JSON.stringify(id));
               continue;
@@ -511,7 +746,14 @@ function handleCompletion(receipt: CompletionReceipt, sessions: Map<string, Conn
       ? receipt.result
       : { error: "toolExecutionFailed", detail: receipt.reason ?? receipt.executionStatus };
   try {
-    ctx.session?.sendToolResponse([{ id: receipt.callId, name: receipt.toolName, response: { output } }]);
+    ctx.session?.sendToolResponse([{ id: entry.responseId || receipt.callId, name: receipt.toolName, response: { output } }]);
+    sendJSON(ctx.ws, {
+      type: "toolCompletion",
+      callId: entry.responseId || receipt.callId,
+      name: receipt.toolName,
+      status: receipt.executionStatus,
+      output,
+    });
     console.log(
       "[server] Completion accepted callId=" + JSON.stringify(receipt.callId) + " status=" + receipt.executionStatus
     );

@@ -39,6 +39,10 @@ const zlib = require("zlib");
 const { createAuditLogger } = require("./lib/auditLogger.cjs");
 const { createKillSwitch } = require("./lib/killSwitch.cjs");
 const { createHandoffAuthority, createHandoffPipeServer } = require("./lib/handoffAuthority.cjs");
+const { createBrowserController } = require("./lib/browserControl.cjs");
+const { createWhatsAppBridge } = require("./lib/whatsappControl.cjs");
+const { createPhoneBridge } = require("./lib/phoneControl.cjs");
+const { createProjectControl } = require("./lib/projectControl.cjs");
 
 const PORT = parseInt(process.env.PORT || "3000", 10);
 const APP_URL = `http://127.0.0.1:${PORT}`;
@@ -98,6 +102,37 @@ const HANDOFF_PIPE = `myra-handoff-${RUN_ID}`; // nonce-gated; name itself carri
 
 const auditLog = createAuditLogger(app.getPath("userData"), RUN_ID);
 const audit = auditLog.audit.bind(auditLog); // callable used across the trust stack
+
+// Phase C: the ONLY component allowed to touch a browser. It owns a dedicated
+// Chromium profile and a loopback-only CDP endpoint; the renderer never sees
+// either. See electron/lib/browserControl.cjs for the full threat model.
+const browserControl = createBrowserController({
+  audit,
+  log,
+  userDataDir: app.getPath("userData"),
+});
+// Messaging: WhatsApp drives the user's own WhatsApp Web session in Myra's
+// browser; Phone Link is report-only because Windows exposes no calling API.
+const whatsappControl = createWhatsAppBridge({ browser: browserControl, audit, log });
+const phoneControl = createPhoneBridge({
+  audit,
+  log,
+  openExternal: (target) => require("electron").shell.openExternal(target),
+});
+// VS Code project builder: filesystem writes happen only here, only after a
+// plan was read back to the user and approved by its one-time planId.
+const projectControl = createProjectControl({
+  audit,
+  log,
+  pickFolder: async () => {
+    const { dialog, BrowserWindow } = require("electron");
+    const parent = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0] || null;
+    const options = { properties: ["openDirectory"], title: "Select a reference folder for Myra" };
+    const res = parent ? await dialog.showOpenDialog(parent, options) : await dialog.showOpenDialog(options);
+    if (!res || res.canceled || !res.filePaths || !res.filePaths.length) return { canceled: true };
+    return { canceled: false, path: res.filePaths[0] };
+  },
+});
 const killSwitch = createKillSwitch((state) => {
   audit(state.engaged ? "KILL_ENGAGED" : "KILL_RELEASED", { reason: state.lastReason });
   log("Kill switch:", state.engaged ? "ENGAGED" : "released", "(" + state.lastReason + ")");
@@ -111,6 +146,10 @@ const authority = createHandoffAuthority({
   audit,
   killSwitch,
   receiptKey: Buffer.from(RECEIPT_KEY_HEX, "hex"),
+  browser: browserControl,
+  whatsapp: whatsappControl,
+  phone: phoneControl,
+  project: projectControl,
   emitCompletion: (frame) => (pipeServer ? pipeServer.broadcast(frame) : false),
   notifyExecuting: (callId, sessionId) => {
     if (pipeServer) pipeServer.broadcast({ type: "execStatus", callId, sessionId, state: "executing" });
@@ -795,6 +834,30 @@ function createWindow() {
     },
   });
 
+  // Phase C: the app window is part of the trust boundary. A renderer must not
+  // be able to spawn a second Electron window, and the app window must never
+  // leave the local app origin (otherwise injected content could take over the
+  // window the user believes is Myra).
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    audit("WINDOW_OPEN_BLOCKED", { reason: "rendererWindowOpen" });
+    log("Blocked renderer window.open →", String(url).slice(0, 120));
+    return { action: "deny" };
+  });
+
+  mainWindow.webContents.on("will-navigate", (event, url) => {
+    let sameOrigin = false;
+    try {
+      sameOrigin = new URL(url).origin === new URL(APP_URL).origin;
+    } catch {
+      sameOrigin = false;
+    }
+    if (!sameOrigin) {
+      event.preventDefault();
+      audit("NAVIGATION_BLOCKED", { reason: "originMismatch" });
+      log("Blocked in-app navigation →", String(url).slice(0, 120));
+    }
+  });
+
   const ses = mainWindow.webContents.session;
 
   // Microphone: allow getUserMedia; everything else falls back to default deny.
@@ -844,6 +907,10 @@ app.on("before-quit", () => {
   } catch {}
   try {
     pipeServer && pipeServer.close();
+  } catch {}
+  try {
+    // CDP sockets only — the browser window stays open for the user.
+    browserControl.dispose();
   } catch {}
   authority.abortPending("appQuit");
   killServerChild();
