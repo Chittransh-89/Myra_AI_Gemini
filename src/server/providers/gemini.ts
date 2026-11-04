@@ -76,6 +76,43 @@ function mapType(t: string): unknown {
   }
 }
 
+/**
+ * Security helper — produces a safe, truncated log string from arbitrary
+ * error/event/unknown values.
+ *
+ * Why this exists: the Gemini Live WebSocket URL contains the API key as a
+ * query parameter (e.g. wss://...?key=...). Serialising raw CloseEvent /
+ * ErrorEvent objects used to print that URL (and therefore the API key) into
+ * the console. This helper stringifies, redacts any credential-bearing query
+ * parameters, and truncates.
+ */
+function sanitizeLogText(raw: unknown): string {
+  let text: string;
+
+  if (raw === undefined || raw === null) {
+    text = "";
+  } else if (typeof raw === "string") {
+    text = raw;
+  } else if (raw instanceof Error) {
+    text = raw.message;
+  } else if (typeof raw === "object") {
+    try {
+      text = JSON.stringify(raw);
+    } catch {
+      text = Object.prototype.toString.call(raw);
+    }
+  } else {
+    text = String(raw);
+  }
+
+  return text
+    .replace(
+      /([?&](?:key|api_key|apikey|api-key|access_token|token|password|secret)\s*=)[^&"',\s]+/gi,
+      "$1[REDACTED]"
+    )
+    .slice(0, 300);
+}
+
 // ---------------------------------------------------------------------------
 // GeminiSession — thin wrapper around a live.connect() session
 // ---------------------------------------------------------------------------
@@ -99,17 +136,22 @@ class GeminiSession implements AIProviderSession {
         },
       });
     } catch (err) {
-      console.error("[GeminiSession] Error sending audio:", err);
+      console.error("[GeminiSession] Error sending audio:", sanitizeLogText(err));
     }
   }
 
   sendToolResponse(responses: import("./types.js").FunctionResponse[]): void {
     if (!this.session) return;
     try {
-      console.log("[GeminiSession] Forwarding tool response to Gemini:", JSON.stringify(responses));
+      // Log tool names only — never serialise full tool payloads (they can
+      // contain arbitrary user data).
+      console.log(
+        "[GeminiSession] Forwarding tool responses:",
+        responses.map((r) => r.name).join(", ") || "(none)"
+      );
       this.session.sendToolResponse({ functionResponses: responses });
     } catch (err) {
-      console.error("[GeminiSession] Error sending tool response:", err);
+      console.error("[GeminiSession] Error sending tool response:", sanitizeLogText(err));
     }
   }
 
@@ -118,7 +160,7 @@ class GeminiSession implements AIProviderSession {
     try {
       this.session.close();
     } catch (err) {
-      console.error("[GeminiSession] Error closing session:", err);
+      console.error("[GeminiSession] Error closing session:", sanitizeLogText(err));
     }
     this.session = null;
   }
@@ -201,19 +243,40 @@ export class GeminiProvider implements AIProvider {
 
           // Forward tool calls to the caller
           if (message.toolCall) {
-            console.log("[GeminiProvider] Tool call requested:", JSON.stringify(message.toolCall));
+            // Log tool names only — never serialise the full message payload.
+            console.log(
+              "[GeminiProvider] Tool calls requested:",
+              Array.isArray(message.toolCall.functionCalls)
+                ? message.toolCall.functionCalls.map((c: { name: string }) => c.name).join(", ")
+                : "(unknown)"
+            );
             callbacks.onToolCall(message.toolCall.functionCalls);
           }
         },
 
         onclose: (event: any) => {
-          console.log("[GeminiProvider] Live connection closed", event);
+          // SECURITY: never log the raw CloseEvent — its target WebSocket URL
+          // contains the GEMINI_API_KEY as a query parameter. Log safe
+          // connection metadata only (code / clean flag / sanitized reason).
+          const code = typeof event?.code === "number" ? event.code : "unknown";
+          const wasClean = typeof event?.wasClean === "boolean" ? event.wasClean : "unknown";
+          console.log(
+            `[GeminiProvider] Live connection closed (code: ${code}, clean: ${wasClean}, reason: ${
+              sanitizeLogText(event?.reason) || "none"
+            })`
+          );
           callbacks.onClose("Gemini connection closed");
         },
 
         onerror: (err: any) => {
-          console.error("[GeminiProvider] Live connection error", err);
-          callbacks.onError(err instanceof Error ? err : new Error(String(err)));
+          // SECURITY: log a sanitized message instead of the raw error object
+          // (error payloads may embed the authenticated request URL).
+          const safeMessage =
+            sanitizeLogText(err instanceof Error ? err.message : err) || "Unknown Gemini Live error";
+          console.error("[GeminiProvider] Live connection error:", safeMessage);
+          callbacks.onError(
+            err instanceof Error ? err : new Error(safeMessage)
+          );
         },
       },
     });

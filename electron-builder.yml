@@ -1,0 +1,32 @@
+# Electron Builder configuration for the Myra AI Windows desktop app.
+# Produces: release/Myra AI Setup <version>.exe (NSIS installer)
+#
+# Notes:
+#  - `dist/**` holds BOTH the built React client and the bundled Node server
+#    (dist/server.cjs) produced by `npm run build`.
+#  - dist is asar-unpacked because production express.static reads those files
+#    from disk (via MYRA_DIST_DIR) and files inside an asar archive are
+#    not directly readable by fs streaming APIs.
+#  - dependencies (not devDependencies) ship with the app: express, ws,
+#    dotenv, @google/genai, vite (imported by the server bundle), react, etc.
+
+appId: com.myraai.desktop
+productName: Myra AI
+directories:
+  output: release
+files:
+  - electron/**/*
+  - dist/**/*
+  - package.json
+asar: true
+asarUnpack:
+  - dist/**/*
+  - "**/*.node"
+npmRebuild: false
+win:
+  target: nsis
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  shortcutName: Myra AI

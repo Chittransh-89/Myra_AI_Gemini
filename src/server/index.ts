@@ -25,7 +25,6 @@
 import express from "express";
 import path from "path";
 import http from "http";
-import { createServer as createViteServer } from "vite";
 import { WebSocketServer, WebSocket } from "ws";
 import type { AIProvider, AIProviderSession } from "./providers/index.js";
 import type { ServerConfig } from "./config.js";
@@ -202,6 +201,8 @@ export async function startServer(provider: AIProvider, config: ServerConfig): P
   // Vite dev middleware or static file serving for production.
   if (config.nodeEnv !== "production") {
     console.log("[server] Starting development server with Vite middleware...");
+    // Lazy import so the production/packaged Electron build never loads Vite.
+    const { createServer: createViteServer } = await import("vite");
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: "spa",
@@ -209,15 +210,19 @@ export async function startServer(provider: AIProvider, config: ServerConfig): P
     app.use(vite.middlewares);
   } else {
     console.log("[server] Starting production server...");
-    const distPath = path.join(process.cwd(), "dist");
+    // Electron packaged build: MYRA_DIST_DIR points at the asar-unpacked dist
+    // directory (real files on disk). Unset -> original behaviour unchanged.
+    const distPath = process.env.MYRA_DIST_DIR
+      ? path.resolve(process.env.MYRA_DIST_DIR)
+      : path.join(process.cwd(), "dist");
     app.use(express.static(distPath));
     app.get("*", (_req, res) => {
       res.sendFile(path.join(distPath, "index.html"));
     });
   }
 
-  server.listen(config.port, "0.0.0.0", () => {
-    console.log(`[server] Myraa AI server listening on http://0.0.0.0:${config.port}`);
+  server.listen(config.port, config.host, () => {
+    console.log(`[server] Myraa AI server listening on http://${config.host}:${config.port}`);
     console.log(`[server] Provider: ${provider.name}`);
   });
 }

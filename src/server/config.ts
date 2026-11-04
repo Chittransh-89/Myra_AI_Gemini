@@ -18,6 +18,9 @@ export interface ServerConfig {
   /** HTTP/WS server port. Defaults to 3000. */
   port: number;
 
+  /** Bind address. Defaults to 127.0.0.1 so the desktop app is not exposed to the LAN. */
+  host: string;
+
   /** Node environment. */
   nodeEnv: string;
 }
@@ -38,11 +41,18 @@ function parsePort(raw: string | undefined): number {
   return isNaN(n) ? 3000 : n;
 }
 
+function parseHost(raw: string | undefined): string {
+  // Desktop-first default: loopback only. HOST=0.0.0.0 restores the old
+  // LAN-exposed behaviour for anyone hosting the website version.
+  return raw ?? "127.0.0.1";
+}
+
 export function loadConfig(): ServerConfig {
   const config: ServerConfig = {
     aiProvider: parseProviderName(process.env.AI_PROVIDER),
     geminiApiKey: process.env.GEMINI_API_KEY,
     port: parsePort(process.env.PORT),
+    host: parseHost(process.env.HOST),
     nodeEnv: process.env.NODE_ENV ?? "development",
   };
 
