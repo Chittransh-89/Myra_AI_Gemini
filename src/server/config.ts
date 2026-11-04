@@ -23,6 +23,29 @@ export interface ServerConfig {
 
   /** Node environment. */
   nodeEnv: string;
+
+  // --- T5.0 trust stack (desktop Electron mode) ---
+
+  /** True when booted by the Electron main process (dev child OR in-process). */
+  electronMode: boolean;
+
+  /** "token" -> unauthenticated WS rejected. "open" -> legacy website behaviour. */
+  websiteMode: "token" | "open";
+
+  /** Per-run WS client credential. Present only in electronMode. NEVER logged. */
+  wsAuthToken: string | undefined;
+
+  /** Named pipe provided by the Electron main Handoff Authority (electronMode). */
+  handoffPipe: string | undefined;
+
+  /** Per-run handshake nonce for the handoff pipe. NEVER logged. */
+  handoffNonce: string | undefined;
+
+  /** Per-run completion-receipt HMAC key (hex), shared main<->server via env. NEVER logged, never sent to the renderer. */
+  receiptKey: string | undefined;
+
+  /** Smoke-test mode (MYRA_SMOKE=1): enables the synthetic pending-call hook for the completion path. */
+  smokeMode: boolean;
 }
 
 function parseProviderName(raw: string | undefined): AIProviderName {
@@ -47,14 +70,41 @@ function parseHost(raw: string | undefined): string {
   return raw ?? "127.0.0.1";
 }
 
+// --- T5.0 trust stack -------------------------------------------------------
+// Electron main sets MYRA_ELECTRON=1 + per-run secrets in env for both server
+// topologies (spawned dev child and in-process). Secrets are never printed.
+
 export function loadConfig(): ServerConfig {
+  const electronMode = process.env.MYRA_ELECTRON === "1";
+  const websiteMode: "token" | "open" = electronMode
+    ? "token"
+    : process.env.MYRA_WEBSITE_MODE === "token"
+    ? "token"
+    : "open";
+
   const config: ServerConfig = {
     aiProvider: parseProviderName(process.env.AI_PROVIDER),
     geminiApiKey: process.env.GEMINI_API_KEY,
     port: parsePort(process.env.PORT),
     host: parseHost(process.env.HOST),
     nodeEnv: process.env.NODE_ENV ?? "development",
+    electronMode,
+    websiteMode,
+    wsAuthToken: electronMode ? process.env.MYRA_WS_TOKEN : undefined,
+    handoffPipe: electronMode ? process.env.MYRA_HANDOFF_PIPE : undefined,
+    handoffNonce: electronMode ? process.env.MYRA_HANDOFF_NONCE : undefined,
+    receiptKey: electronMode ? process.env.MYRA_RECEIPT_KEY : undefined,
+    smokeMode: process.env.MYRA_SMOKE === "1",
   };
+
+  if (websiteMode === "open" || websiteMode === "token") {
+    if (!electronMode && websiteMode === "open") {
+      console.log(
+        "[config] Standalone website mode (no Electron): WS auth disabled by policy — " +
+          "desktop tool handoff is permanently unavailable in this mode."
+      );
+    }
+  }
 
   // Warn early so the developer sees the issue before the first WebSocket connection.
   if (config.aiProvider === "gemini" && !config.geminiApiKey) {

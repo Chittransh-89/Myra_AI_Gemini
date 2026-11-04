@@ -40,6 +40,8 @@ export interface ToolCallUpdate {
     name: string;
     args: any;
     id: string;
+    /** T5.0: one-time handoff ticket from the Electron main process (Electron runs only). */
+    handoff?: { ticket?: string; error?: string };
   }>;
 }
 

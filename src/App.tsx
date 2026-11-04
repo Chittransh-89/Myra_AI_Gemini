@@ -163,7 +163,13 @@ export default function App() {
 
       // 3. Setup WebSocket connection URL
       const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-      const wsUrl = `${protocol}//${window.location.host}/ws`;
+      // T5.0: Electron runs authenticate with a per-run token delivered by
+      // the preload bridge. Standalone website (no bridge) keeps the legacy
+      // unauthenticated URL.
+      const desktop = (window as any).myraDesktop;
+      const authToken = typeof desktop?.wsAuthToken === "string" ? desktop.wsAuthToken : null;
+      const authSuffix = authToken ? `?auth=${encodeURIComponent(authToken)}` : "";
+      const wsUrl = `${protocol}//${window.location.host}/ws${authSuffix}`;
 
       console.log("Connecting to voice-to-voice server at:", wsUrl);
       const ws = new WebSocket(wsUrl);
@@ -234,19 +240,44 @@ export default function App() {
               console.log(`Executing tool ${name} with args:`, args);
 
               if (name === "getSystemTime") {
-                const now = new Date();
-                output = {
-                  time: now.toLocaleTimeString(),
-                  date: now.toLocaleDateString(),
-                  timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-                };
+                // T5.0: in Electron, execute through the main-process Handoff
+                // Authority (ticket-validated). In the standalone website,
+                // keep the exact legacy renderer-side execution.
+                const desktopApi = (window as any).myraDesktop;
+                const handoffTicket = (call as any)?.handoff?.ticket;
+                if (desktopApi?.executeTool) {
+                  try {
+                    if (!handoffTicket) {
+                      output = { error: "handoffUnavailable" };
+                    } else {
+                      const result = await desktopApi.executeTool({
+                        ticket: handoffTicket,
+                        name,
+                        args,
+                      });
+                      output =
+                        result?.status === "ok"
+                          ? result.output
+                          : { error: result?.reason || "toolDenied" };
+                    }
+                  } catch (e: any) {
+                    output = { error: e?.message || "handoffError" };
+                  }
+                } else {
+                  const now = new Date();
+                  output = {
+                    time: now.toLocaleTimeString(),
+                    date: now.toLocaleDateString(),
+                    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+                  };
+                }
 
                 setExecutedTools((prev) => [
                   {
                     id,
                     name,
                     args,
-                    timestamp: now.toLocaleTimeString(),
+                    timestamp: new Date().toLocaleTimeString(),
                     status: "success",
                     result: `Local time: ${output.time}`,
                   },
