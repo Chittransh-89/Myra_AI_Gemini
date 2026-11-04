@@ -7,3 +7,8 @@ coverage/
 .env*
 !.env.example
 .freebuff
+
+# Electron build files
+release/
+dist/
+node_modules/
