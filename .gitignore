@@ -1,14 +1,32 @@
-node_modules/
-build/
-dist/
-coverage/
-.DS_Store
-*.log
-.env*
-!.env.example
-.freebuff
+# ============ Myra AI — Git ignore ============
 
-# Electron build files
-release/
-dist/
+# --- Secrets / env (NEVER push API keys) ---
+.env
+.env.*
+!.env.example
+
+# --- Dependencies ---
 node_modules/
+
+# --- Build outputs ---
+dist/
+build/
+release/
+
+# --- App-specific ---
+.freebuff/
+assets/.aistudio/
+
+# --- Logs ---
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# --- OS junk ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Editor / IDE ---
+.vscode/
+.idea/
