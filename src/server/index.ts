@@ -52,6 +52,7 @@ const MAIN_EXECUTED_TOOLS = new Set<string>([
   "whatsappControl",
   "phoneControl",
   "projectControl",
+  "fileControl",
 ]);
 
 // A tool-call id must be usable as a registry key and an audit field.
@@ -98,8 +99,31 @@ You are communicating strictly via real-time audio (voice-to-voice). Keep your r
 You have access to REAL desktop tools. Use them instead of only talking:
 - openWebsite: opens a site in Myra's own visible browser window.
 - browserControl: search YouTube, scroll, list the videos on screen, open a specific
-  video by its title, and play or pause it. Always search first, then open the video
-  whose title best matches what the user asked for. Reuse the same tab.
+  video by its title, and control playback in Myra's existing browser tab.
+  Always search first, then open the video whose title best matches what the user
+  asked for. Reuse the same tab — never launch another browser.
+  Actions:
+  * 'openShorts': open the YouTube Shorts feed.
+  * 'nextShort' / 'previousShort': move ONE short down/up (Hindi: "agla short",
+    "pichla short"). 'scroll' with direction down/up does the same thing while on
+    Shorts, so never use 'seek' to change shorts.
+  * 'playPause' (state play/pause/toggle — for "pause karo" use state:'pause',
+    for "chalao/resume/play" use state:'play'), 'mute', 'unmute', 'setVolume' (exact level 0-100),
+    'increaseVolume' / 'decreaseVolume' (RELATIVE step, default 10%), 'getVolume' (report the
+    current volume). For "volume kam karo" / "volume badhao" ALWAYS use the relative actions;
+    never invent an absolute level yourself. "Aur kam/badhao" means call the same relative
+    action again. "volume 50 karo" uses setVolume level:50. "volume kitna hai?" uses
+    getVolume. Myra clamps at 0 and 100 and reports the volume it actually read back.
+    'fullscreen', 'exitFullscreen', 'restart'.
+  * 'seek': RELATIVE timeline move only, in seconds. Positive = ahead, negative =
+    back. "10 seconds aage" -> seconds:10. "25 seconds back" -> seconds:-25.
+    "1 minute 30 seconds ahead" -> seconds:90 (or minutes:1, seconds:30).
+    "2 minutes back" -> seconds:-120. Never pass an absolute timestamp, never do
+    seeking math yourself outside these units. Myra clamps at 0 and at the video
+    duration and reports the real position it reached. Works on both normal videos
+    and Shorts. Scrolling a page is NOT seeking; seeking is NOT scrolling.
+  After any playback action, speak only what the result reports (position/time,
+  paused or playing, volume, fullscreen) and say plainly if it failed.
 - whatsappControl: WhatsApp via the user's OWN WhatsApp Web session in Myra's browser.
   Flow is ALWAYS: action 'status' if you are unsure -> action 'prepare' (writes the
   message in the chat, does NOT send) -> tell the user exactly who and what, wait for
@@ -110,6 +134,25 @@ You have access to REAL desktop tools. Use them instead of only talking:
 - phoneControl: Microsoft Phone Link. Phone Link has NO public API on Windows, so you
   CANNOT place a call yourself. 'status' explains why; 'open' brings Phone Link to the
   front so the user can tap the contact. Never say you called someone.
+- fileControl: open, read, understand and analyze files on the user's computer.
+  Actions:
+  * 'current': read the file currently open for this conversation (use this when the
+    user says "this file", "the file", "ismein" without giving a path). Returns a CHUNK.
+  * 'pick': open the native Windows file picker so the user can choose a file.
+  * 'read': read an absolute path (requires the user's permission for that file).
+  * 'authorize': ask the user to approve one exact path (native Allow/Cancel), then read it.
+  * 'list', 'switch' (by id or name), 'close', 'closeAll': manage the open-file context.
+  * 'search': literal search with line numbers — use it for "find a particular
+    function" instead of dumping the whole file.
+  * 'compare': compare 2-4 opened/authorized files.
+  Reading is chunked: each read returns offset/chunkChars/totalChars/nextOffset/hasMore.
+  If hasMore is true, read the next part with action 'read' + offset:nextOffset (or
+  'current' + offset) before claiming you have seen the whole file. NEVER invent,
+  paraphrase as if quoted, or guess file contents: answer only from the returned text.
+  If a result is notAuthorized, ask the user and then call 'authorize' with that exact
+  path. If the result is noOpenFile, offer to open a file. Only for PDFs you may say a
+  page count when it is reported. Speak the real filename and say plainly when a file
+  could not be read.
 - getSystemTime: the current local date/time.
 - projectControl: VS Code project builder and file manager.
   Actions:
@@ -157,7 +200,7 @@ const BUILT_IN_TOOLS: ToolDeclaration[] = [
   {
     name: "browserControl",
     description:
-      "Controls Myra's visible browser window: YouTube search, scrolling, opening a specific video, playback, and the window itself. Actions: 'search' (search YouTube and return the top results), 'listVideos' (list the videos on the current results page), 'clickVideo' (open one video by its title or its index from a previous search), 'scroll' (scroll the page up/down), 'playPause' (play, pause or toggle the current video), 'open' (go to a URL), 'back' (previous page), 'closeTab' (close only Myra's current tab), 'close' (close Myra's whole browser window — use this whenever the user asks to close the browser, close YouTube or stop watching), 'maximize' (maximize Myra's browser window — e.g. 'browser maximize karo'), 'minimize' (minimize Myra's browser window — e.g. 'browser minimize karo'), 'restore' (bring Myra's browser window back to its normal size/state — e.g. 'browser restore karo').",
+      "Controls Myra's existing visible browser window: YouTube search, Shorts navigation, video playback, relative seeking, and the window itself. Actions: 'search' (search YouTube and return the top results), 'listVideos' (list the videos on the current results page), 'clickVideo' (open one video by its title or its index from a previous search), 'openShorts' (open the YouTube Shorts feed), 'nextShort' (move to the next Short; Hindi 'agla short'), 'previousShort' (move to the previous Short; Hindi 'pichla short'), 'scroll' (scroll the page up/down; on Shorts it moves one Short down/up), 'seek' (RELATIVE timeline move in seconds on the current video or Short — positive ahead, negative back; e.g. 10 seconds ahead = seconds:10, 25 seconds back = seconds:-25, 1 minute 30 ahead = seconds:90, 2 minutes back = seconds:-120; never an absolute timestamp), 'playPause' (ONE action — always pass state:'pause' to pause, state:'play' to resume/play, state:'toggle' to switch; never send action:'pause' or action:'play' by themselves), 'mute', 'unmute' (restores the previous audible volume), 'setVolume' (exact level 0-100), 'increaseVolume' / 'decreaseVolume' (RELATIVE step, default 10%, clamped 0-100 — use these for 'volume kam/badhao'), 'getVolume' (report the current volume), 'fullscreen', 'exitFullscreen', 'restart' (back to 0s and play), 'open' (go to a URL), 'back' (previous page), 'closeTab' (close only Myra's current tab), 'close' (close Myra's whole browser window), 'maximize', 'minimize', 'restore'.",
     parameters: {
       type: "object",
       properties: {
@@ -169,7 +212,20 @@ const BUILT_IN_TOOLS: ToolDeclaration[] = [
             "listVideos",
             "clickVideo",
             "scroll",
+            "openShorts",
+            "nextShort",
+            "previousShort",
+            "seek",
             "playPause",
+            "mute",
+            "unmute",
+            "setVolume",
+            "increaseVolume",
+            "decreaseVolume",
+            "getVolume",
+            "fullscreen",
+            "exitFullscreen",
+            "restart",
             "open",
             "back",
             "closeTab",
@@ -203,8 +259,28 @@ const BUILT_IN_TOOLS: ToolDeclaration[] = [
         },
         state: {
           type: "string",
-          description: "Explicit playback state for 'playPause'.",
+          description:
+            "Playback state for 'playPause': 'pause' pauses, 'play' resumes/plays, 'toggle' switches. Always send the explicit state for a pause/play command.",
           enum: ["play", "pause", "toggle"],
+        },
+        seconds: {
+          type: "number",
+          description:
+            "Relative seek offset in SECONDS for 'seek'. Positive = forward, negative = back. Examples: 10 (10s ahead), -25 (25s back), 90 (1m30s ahead), -120 (2m back). Never an absolute timestamp; Myra clamps to 0 and the video duration.",
+        },
+        minutes: {
+          type: "number",
+          description:
+            "Optional whole minutes for 'seek', added to 'seconds'. Example: 1 minute 30 seconds ahead -> minutes:1, seconds:30.",
+        },
+        level: {
+          type: "number",
+          description: "Exact volume percentage 0-100 for 'setVolume'. 0 mutes; 100 is full volume.",
+        },
+        step: {
+          type: "number",
+          description:
+            "Relative volume step in percentage points for 'increaseVolume'/'decreaseVolume'. Default 10; clamped to 1-100. Do not pass a step for ordinary 'volume kam/badhao' commands.",
         },
       },
       required: ["action"],
@@ -250,6 +326,73 @@ const BUILT_IN_TOOLS: ToolDeclaration[] = [
           type: "string",
           description: "The phone action to perform.",
           enum: ["status", "open"],
+        },
+      },
+      required: ["action"],
+    },
+  },
+  {
+    name: "fileControl",
+    description:
+      "Opens, reads and analyzes files on the user's computer (TXT, MD, PDF, DOCX, CSV, JSON, and source code such as JS/TS/JSX/TSX/PY/HTML/CSS/XML). Every read requires the user's explicit authorization for that exact file. Reading is chunked for large files. Actions: 'current' (read the file already open for this conversation), 'pick' (native file picker), 'read' (absolute path after authorization), 'authorize' (native Allow/Cancel for one path), 'list', 'switch', 'search' (literal search with line numbers), 'compare' (2-4 files), 'close', 'closeAll'. Answer only from the returned text; never fabricate file contents.",
+    parameters: {
+      type: "object",
+      properties: {
+        action: {
+          type: "string",
+          description: "The file action to perform.",
+          enum: [
+            "pick",
+            "read",
+            "authorize",
+            "current",
+            "list",
+            "switch",
+            "search",
+            "compare",
+            "close",
+            "closeAll",
+          ],
+        },
+        path: {
+          type: "string",
+          description:
+            "Absolute path of one file, for 'read', 'authorize' or 'search'. Not a folder and not a relative path.",
+        },
+        paths: {
+          type: "array",
+          description: "Two to four absolute file paths for 'compare'.",
+          items: { type: "string" },
+        },
+        ids: {
+          type: "array",
+          description: "Open file ids (from 'list') for 'compare'.",
+          items: { type: "string" },
+        },
+        id: {
+          type: "string",
+          description: "Open file id or exact filename, for 'switch', 'close' or 'read'.",
+        },
+        name: {
+          type: "string",
+          description: "Exact filename to switch to or close (alternative to 'id').",
+        },
+        query: {
+          type: "string",
+          description: "Literal text to find for 'search' (a function name, class, variable, error message).",
+        },
+        offset: {
+          type: "number",
+          description:
+            "Character offset for chunked reading. Start at 0; use nextOffset from the previous result to continue.",
+        },
+        maxChars: {
+          type: "number",
+          description: "Requested chunk size in characters (default 4000, max 12000; large requests are trimmed to fit).",
+        },
+        maxMatches: {
+          type: "number",
+          description: "Maximum search matches to return (default 12, max 20).",
         },
       },
       required: ["action"],

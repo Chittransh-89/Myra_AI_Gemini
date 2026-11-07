@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>WhatsApp send fixture</title>
+<style>
+  html, body { margin: 0; height: 100%; font-family: sans-serif; }
+  #main { display: flex; flex-direction: column; height: 100vh; }
+  #messages { flex: 1; overflow: auto; padding: 12px; display: flex; flex-direction: column; gap: 6px; }
+  .message-out { align-self: flex-end; background: #d9fdd3; padding: 6px 10px; border-radius: 8px; }
+  footer { display: flex; align-items: center; gap: 8px; padding: 10px; border-top: 1px solid #ccc; }
+  #composer { flex: 1; min-height: 24px; border: 1px solid #bbb; border-radius: 6px; padding: 6px; }
+  button { width: 44px; height: 36px; }
+</style>
+</head>
+<body>
+<div id="main">
+  <div id="pane-side" style="display:none"></div>
+  <header style="padding:10px;border-bottom:1px solid #ccc">Test chat</header>
+  <div id="messages"></div>
+  <footer>
+    <button id="attach" aria-label="Attach">+</button>
+    <div id="composer" contenteditable="true" role="textbox" aria-label="Type a message"></div>
+    <button id="send" aria-label="Send" data-icon="send" disabled>&#10148;</button>
+  </footer>
+</div>
+<script>
+(function () {
+  var q = new URLSearchParams(location.search);
+  var composer = document.getElementById("composer");
+  var sendBtn = document.getElementById("send");
+  var messages = document.getElementById("messages");
+
+  var dead = q.get("dead") === "1";
+  var enterSends = q.get("enter") !== "0";
+  var requireTrusted = q.get("requireTrusted") === "1";
+  var readyDelay = Number(q.get("readyDelay") || 0);
+  var seedText = q.get("seedText") || "Hello from Myra";
+
+  // Localized WhatsApp UI: the English aria-label and data-icon are both gone.
+  if (q.get("label") === "hi") {
+    sendBtn.setAttribute("aria-label", "\u092d\u0947\u091c\u0947\u0902");
+    sendBtn.removeAttribute("data-icon");
+  }
+
+  var readyAt = 0;
+  window.__sent = 0;
+  window.__lastSent = "";
+  window.__lastMethod = "";
+
+  function norm(s) {
+    return String(s == null ? "" : s).replace(/\u200b/g, "").replace(/\s+/g, " ").trim();
+  }
+
+  // WhatsApp's control is React state driven: it stays disabled until the
+  // composer value is committed. Deliberately asynchronous.
+  function update() {
+    var hasText = norm(composer.innerText).length > 0;
+    if (hasText && !readyAt) readyAt = Date.now() + readyDelay;
+    sendBtn.disabled = dead || !hasText || Date.now() < readyAt;
+  }
+  setInterval(update, 40);
+
+  function send(via) {
+    var text = norm(composer.innerText);
+    if (!text) return false;
+    var row = document.createElement("div");
+    row.className = "message-out";
+    var span = document.createElement("span");
+    span.className = "selectable-text copyable-text";
+    span.textContent = text;
+    row.appendChild(span);
+    messages.appendChild(row);
+    window.__sent += 1;
+    window.__lastSent = text;
+    window.__lastMethod = via;
+    composer.textContent = "";
+    readyAt = 0;
+    update();
+    return true;
+  }
+
+  sendBtn.addEventListener("click", function (e) {
+    if (sendBtn.disabled) return;
+    if (requireTrusted && !e.isTrusted) return;
+    send("button");
+  });
+
+  composer.addEventListener("keydown", function (e) {
+    if (e.key !== "Enter" || e.shiftKey) return;
+    if (dead) return; // sending is blocked entirely in this fixture mode
+    if (!enterSends) return; // "Enter is send" turned off -> newline only
+    e.preventDefault();
+    send("enter");
+  });
+
+  if (q.get("seed") === "1") {
+    var row = document.createElement("div");
+    row.className = "message-out";
+    var span = document.createElement("span");
+    span.className = "selectable-text copyable-text";
+    span.textContent = seedText;
+    row.appendChild(span);
+    messages.appendChild(row);
+  }
+
+  if (q.get("noComposer") === "1") composer.remove();
+
+  window.__fixtureSend = send;
+  window.__fixtureReady = true;
+})();
+</script>
+</body>
+</html>

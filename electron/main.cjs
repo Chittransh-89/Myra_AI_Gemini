@@ -43,6 +43,7 @@ const { createBrowserController } = require("./lib/browserControl.cjs");
 const { createWhatsAppBridge } = require("./lib/whatsappControl.cjs");
 const { createPhoneBridge } = require("./lib/phoneControl.cjs");
 const { createProjectControl } = require("./lib/projectControl.cjs");
+const { createFileControl } = require("./lib/fileControl.cjs");
 
 const PORT = parseInt(process.env.PORT || "3000", 10);
 const APP_URL = `http://127.0.0.1:${PORT}`;
@@ -133,6 +134,48 @@ const projectControl = createProjectControl({
     return { canceled: false, path: res.filePaths[0] };
   },
 });
+// File access: the ONLY component allowed to read user files. It keeps the
+// per-session authorization list and the open-file context in main; the
+// renderer can only trigger the native picker (a user gesture).
+const fileControl = createFileControl({
+  audit,
+  log,
+  pickFiles: async () => {
+    const parent = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0] || null;
+    const options = {
+      title: "Open a file for Myra",
+      properties: ["openFile", "multiSelections"],
+      filters: [
+        {
+          name: "Readable files",
+          extensions: [
+            "txt", "md", "pdf", "docx", "csv", "json", "js", "ts", "jsx", "tsx",
+            "py", "html", "css", "xml", "yml", "yaml", "log", "sql", "java", "go", "rs",
+          ],
+        },
+        { name: "All files", extensions: ["*"] },
+      ],
+    };
+    const res = parent ? await dialog.showOpenDialog(parent, options) : await dialog.showOpenDialog(options);
+    return { canceled: !!(res && res.canceled), paths: (res && res.filePaths) || [] };
+  },
+  confirmPath: async (filePath) => {
+    const parent = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0] || null;
+    const options = {
+      type: "question",
+      title: "Myra file access",
+      message: "Allow Myra to read this file?",
+      detail: filePath + "\n\nMyra sends the extracted text to Gemini for this conversation. Nothing is uploaded elsewhere and file contents are never executed.",
+      buttons: ["Allow Myra to read", "Cancel"],
+      defaultId: 1,
+      cancelId: 1,
+      noLink: true,
+    };
+    const res = parent ? await dialog.showMessageBox(parent, options) : await dialog.showMessageBox(options);
+    return res && res.response === 0;
+  },
+  onState: (state) => broadcastFileState(state),
+});
 const killSwitch = createKillSwitch((state) => {
   audit(state.engaged ? "KILL_ENGAGED" : "KILL_RELEASED", { reason: state.lastReason });
   log("Kill switch:", state.engaged ? "ENGAGED" : "released", "(" + state.lastReason + ")");
@@ -150,6 +193,7 @@ const authority = createHandoffAuthority({
   whatsapp: whatsappControl,
   phone: phoneControl,
   project: projectControl,
+  file: fileControl,
   emitCompletion: (frame) => (pipeServer ? pipeServer.broadcast(frame) : false),
   notifyExecuting: (callId, sessionId) => {
     if (pipeServer) pipeServer.broadcast({ type: "execStatus", callId, sessionId, state: "executing" });
@@ -168,11 +212,30 @@ function buildServerEnv() {
   };
 }
 
+function broadcastFileState(state) {
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (!win.isDestroyed()) {
+      try {
+        win.webContents.send("myra:file:state", state);
+      } catch {
+        /* window closing */
+      }
+    }
+  }
+}
+
 function registerIpcHandlers() {
   // Preload reads the per-run WS credential exactly once, synchronously.
   ipcMain.on("myra:auth:ws-token", (event) => {
     event.returnValue = WS_TOKEN;
   });
+
+  // File access surface for the renderer. These only open the native picker,
+  // read the current context state, or clear the context — they can never
+  // read an arbitrary path. Actual reads happen through the Handoff Authority.
+  ipcMain.handle("myra:file:pick", async () => fileControl.pickFromUi());
+  ipcMain.handle("myra:file:state:get", () => fileControl.getState());
+  ipcMain.handle("myra:file:close", () => fileControl.closeFromUi());
 
   // The renderer's ONLY tool path. Everything is validated inside the
   // authority (signature, registry membership, expiry, single-use, digest).

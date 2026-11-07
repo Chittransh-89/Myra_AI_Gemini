@@ -42,7 +42,7 @@ const DEFAULT_TICKET_TTL_MS = 20000;
 // Both are declared builtin names; nothing else may be registered.
 // WhatsApp and Phone Link joined later: both are main-executed so no renderer
 // code ever authors a Gemini-visible messaging result.
-const EXECUTOR_NAMES = new Set(["getSystemTime", "openWebsite", "browserControl", "whatsappControl", "phoneControl", "projectControl"]);
+const EXECUTOR_NAMES = new Set(["getSystemTime", "openWebsite", "browserControl", "whatsappControl", "phoneControl", "projectControl", "fileControl"]);
 const MAX_RESULT_BYTES = 8 * 1024;          // canonical result cap (receipt)
 const MAX_PENDING_PER_CHANNEL = 64;         // concurrent registrations per pipe channel
 
@@ -69,7 +69,7 @@ function toPipePath(name) {
   return name.startsWith("\\\\.\\pipe\\") || name.startsWith("\\\\?\\pipe\\") ? name : "\\\\.\\pipe\\" + name;
 }
 
-function createHandoffAuthority({ audit, killSwitch, receiptKey, emitCompletion, notifyExecuting, browser, whatsapp, phone, project }) {
+function createHandoffAuthority({ audit, killSwitch, receiptKey, emitCompletion, notifyExecuting, browser, whatsapp, phone, project, file }) {
   const hmacKey = crypto.randomBytes(32); // ticket key — never leaves this process, never logged
   if (!Buffer.isBuffer(receiptKey) || receiptKey.length === 0) {
     throw new Error("createHandoffAuthority: receiptKey (Buffer) is required for completion signing");
@@ -134,6 +134,11 @@ function createHandoffAuthority({ audit, killSwitch, receiptKey, emitCompletion,
       if (action === "edit") return project.edit(args);
       return { ok: false, error: "unsupportedAction" };
     });
+  }
+  // File reading. Main-process only: the renderer never receives fs access and
+  // every read requires a user authorization recorded in this session.
+  if (file && typeof file.run === "function") {
+    executors.set("fileControl", (args) => file.run(args));
   }
   let generation = 0; // bumped by the kill switch; stale async completions are suppressed
   const stats = {

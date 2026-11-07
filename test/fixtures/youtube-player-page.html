@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>YouTube player fixture</title>
+<style>
+  html, body { margin: 0; background: #111; color: #eee; font-family: sans-serif; }
+  #movie_player, #shorts-player { position: relative; width: 640px; height: 360px; background: #000; }
+  video { width: 640px; height: 360px; background: #000; }
+  ytd-reel-video-renderer { display: none; }
+  ytd-reel-video-renderer[is-active] { display: block; }
+  #navigation-button-up, #navigation-button-down { position: absolute; right: 8px; }
+  #navigation-button-up { top: 8px; }
+  #navigation-button-down { top: 60px; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<script>
+(function () {
+  var q = new URLSearchParams(location.search);
+  var mode = q.get("mode") === "shorts" || location.pathname.indexOf("/shorts") === 0 ? "shorts" : "watch";
+  var app = document.getElementById("app");
+  var videos = [];
+
+  // A mock media element keeps the DOM/player contract (duration, currentTime,
+  // paused, muted, volume, play/pause) without needing a codec or network file.
+  function mockVideo(v, start, duration) {
+    var pos = start;
+    var paused = true;
+    var muted = false;
+    var vol = 1;
+    Object.defineProperty(v, "duration", { configurable: true, get: function () { return duration; } });
+    Object.defineProperty(v, "currentTime", {
+      configurable: true,
+      get: function () { return pos; },
+      set: function (x) { pos = Math.max(0, Math.min(Number(x) || 0, duration)); },
+    });
+    Object.defineProperty(v, "paused", { configurable: true, get: function () { return paused; } });
+    Object.defineProperty(v, "ended", { configurable: true, get: function () { return pos >= duration; } });
+    Object.defineProperty(v, "muted", {
+      configurable: true,
+      get: function () { return muted; },
+      set: function (x) { muted = !!x; },
+    });
+    Object.defineProperty(v, "volume", {
+      configurable: true,
+      get: function () { return vol; },
+      set: function (x) { vol = Math.max(0, Math.min(Number(x) || 0, 1)); },
+    });
+    v.play = function () { paused = false; return Promise.resolve(); };
+    v.pause = function () { paused = true; };
+    videos.push(v);
+    return v;
+  }
+
+  if (q.get("novideo") !== "1") {
+    if (mode === "shorts") {
+      var holder = document.createElement("div");
+      holder.id = "shorts-player";
+
+      for (var i = 0; i < 3; i++) {
+        var reel = document.createElement("ytd-reel-video-renderer");
+        reel.setAttribute("data-video-id", "short" + (i + 1));
+        if (i === 0) reel.setAttribute("is-active", "");
+        reel.appendChild(mockVideo(document.createElement("video"), 0, 60));
+        holder.appendChild(reel);
+      }
+
+      var navUp = document.createElement("div");
+      navUp.id = "navigation-button-up";
+      var upBtn = document.createElement("button");
+      upBtn.textContent = "up";
+      navUp.appendChild(upBtn);
+
+      var navDown = document.createElement("div");
+      navDown.id = "navigation-button-down";
+      var downBtn = document.createElement("button");
+      downBtn.textContent = "down";
+      navDown.appendChild(downBtn);
+
+      app.appendChild(holder);
+      holder.appendChild(navUp);
+      holder.appendChild(navDown);
+
+      var reels = Array.prototype.slice.call(document.querySelectorAll("ytd-reel-video-renderer"));
+      var index = 0;
+
+      function activate(next) {
+        if (next < 0 || next >= reels.length) return false;
+        index = next;
+        for (var j = 0; j < reels.length; j++) {
+          if (j === index) reels[j].setAttribute("is-active", "");
+          else reels[j].removeAttribute("is-active");
+        }
+        history.replaceState(null, "", "/shorts/" + reels[index].getAttribute("data-video-id") + location.search);
+        return true;
+      }
+      function step(dir) { return activate(index + (dir === "down" ? 1 : -1)); }
+
+      if (q.get("wheel") !== "0") {
+        window.addEventListener("wheel", function (e) {
+          if (Math.abs(e.deltaY) > 0 && step(e.deltaY > 0 ? "down" : "up")) e.preventDefault();
+        }, { passive: false });
+      }
+      if (q.get("keys") !== "0") {
+        document.addEventListener("keydown", function (e) {
+          if (e.key === "ArrowDown") { if (step("down")) e.preventDefault(); }
+          else if (e.key === "ArrowUp") { if (step("up")) e.preventDefault(); }
+        });
+      }
+      upBtn.addEventListener("click", function () { step("up"); });
+      downBtn.addEventListener("click", function () { step("down"); });
+    } else {
+      var player = document.createElement("div");
+      player.id = "movie_player";
+      if (q.get("ad") === "1") player.className = "ad-showing";
+      var v = document.createElement("video");
+      v.className = "html5-main-video";
+      mockVideo(v, Number(q.get("start") || 30), Number(q.get("duration") || 180));
+      player.appendChild(v);
+      app.appendChild(player);
+    }
+  }
+
+  window.__fixture = {
+    mode: mode,
+    videos: videos.length,
+    position: function (i) { return videos[i] ? videos[i].currentTime : null; },
+  };
+  window.__fixtureReady = true;
+})();
+</script>
+</body>
+</html>

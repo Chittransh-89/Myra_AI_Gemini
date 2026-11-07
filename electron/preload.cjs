@@ -40,4 +40,21 @@ contextBridge.exposeInMainWorld("myraDesktop", {
     if (!payload || typeof payload !== "object") return Promise.resolve({ status: "denied", reason: "malformed" });
     return ipcRenderer.invoke("myra:tool:execute", payload);
   },
+
+  // --- File context bridge (metadata only; no fs, no content) ---
+  // 'pick' opens the native Windows file picker (a user gesture) and returns
+  // the resulting context state. It cannot read an arbitrary path. The main
+  // process performs every read and only exposes the file NAME/metadata here;
+  // Myra reads content through the fileControl tool, under user authorization.
+  fileAccess: {
+    pick: () => ipcRenderer.invoke("myra:file:pick"),
+    state: () => ipcRenderer.invoke("myra:file:state:get"),
+    close: () => ipcRenderer.invoke("myra:file:close"),
+    onState: (callback) => {
+      if (typeof callback !== "function") return () => {};
+      const handler = (_event, state) => callback(state);
+      ipcRenderer.on("myra:file:state", handler);
+      return () => ipcRenderer.removeListener("myra:file:state", handler);
+    },
+  },
 });

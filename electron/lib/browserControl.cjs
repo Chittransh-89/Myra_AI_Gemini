@@ -53,6 +53,19 @@ const BROWSER_ACTIONS = new Set([
   "clickVideo",
   "scroll",
   "playPause",
+  "openShorts",
+  "nextShort",
+  "previousShort",
+  "seek",
+  "mute",
+  "unmute",
+  "setVolume",
+  "increaseVolume",
+  "decreaseVolume",
+  "getVolume",
+  "fullscreen",
+  "exitFullscreen",
+  "restart",
   "back",
   "closeTab",
   "close",
@@ -75,6 +88,132 @@ const WINDOW_ACTION_ALIASES = new Map([
   ["restoreWindow", "restore"],
 ]);
 
+const SHORTS_URL = "https://www.youtube.com/shorts/";
+const MAX_SEEK_SECONDS = 24 * 60 * 60; // one day; the real duration clamps it far lower
+const MAX_VOLUME_PERCENT = 100;
+
+// Voice phrasings the model may emit -> canonical action names (keys lowercase).
+const BROWSER_ACTION_ALIASES = new Map([
+  ["openshorts", "openShorts"],
+  ["openshortsfeed", "openShorts"],
+  ["shorts", "openShorts"],
+  ["nextshort", "nextShort"],
+  ["shortnext", "nextShort"],
+  ["next", "nextShort"],
+  ["previousshort", "previousShort"],
+  ["prevshort", "previousShort"],
+  ["shortprevious", "previousShort"],
+  ["previous", "previousShort"],
+  ["prev", "previousShort"],
+  ["seekby", "seek"],
+  ["seekrelative", "seek"],
+  ["skip", "seek"],
+  ["forward", "seek"],
+  ["backward", "seek"],
+  ["rewind", "seek"],
+  ["volume", "setVolume"],
+  ["vol", "setVolume"],
+  ["volumeup", "increaseVolume"],
+  ["volup", "increaseVolume"],
+  ["louder", "increaseVolume"],
+  ["increasevolume", "increaseVolume"],
+  ["volumedown", "decreaseVolume"],
+  ["voldown", "decreaseVolume"],
+  ["quieter", "decreaseVolume"],
+  ["decreasevolume", "decreaseVolume"],
+  ["getvolume", "getVolume"],
+  ["currentvolume", "getVolume"],
+  ["volumelevel", "getVolume"],
+  ["enterfullscreen", "fullscreen"],
+  ["fullscreenon", "fullscreen"],
+  ["exitfullscreen", "exitFullscreen"],
+  ["leavefullscreen", "exitFullscreen"],
+  ["fullscreenoff", "exitFullscreen"],
+  ["replay", "restart"],
+  ["startover", "restart"],
+]);
+
+// Playback phrasings the model may emit as the ACTION itself ("pause",
+// "resume") instead of the canonical { action: "playPause", state: ... }.
+// Each entry maps to the explicit state it implies, so "pause" can never
+// accidentally toggle an already-paused video back into playing.
+const PLAYBACK_ALIASES = new Map([
+  ["pause", "pause"],
+  ["paused", "pause"],
+  ["stop", "pause"],
+  ["stopvideo", "pause"],
+  ["pausevideo", "pause"],
+  ["play", "play"],
+  ["resume", "play"],
+  ["unpause", "play"],
+  ["continue", "play"],
+  ["start", "play"],
+  ["startvideo", "play"],
+  ["playvideo", "play"],
+  ["toggle", "toggle"],
+  ["toggleplay", "toggle"],
+  ["togglepause", "toggle"],
+]);
+
+/** Canonical playback state from any spelling the model may send. */
+function normalizePlaybackState(value) {
+  const v = String(value == null ? "" : value).trim().toLowerCase();
+  if (!v) return null;
+  if (v === "play" || v === "playing" || v === "resume" || v === "unpause" || v === "continue") {
+    return "play";
+  }
+  if (v === "pause" || v === "paused" || v === "stop" || v === "stopped") {
+    return "pause";
+  }
+  if (v === "toggle") return "toggle";
+  return null;
+}
+
+/**
+ * Resolve the model's action name + arguments into a canonical browser action.
+ *
+ * Voice models frequently emit { action: "pause" } / { action: "resume" } even
+ * though the canonical action is "playPause" with a state. Those phrasings are
+ * mapped here (with the state they imply) instead of failing as
+ * unsupportedAction. Pure function so it can be unit-tested without a browser.
+ */
+function resolveBrowserAction(rawArgs) {
+  const args = rawArgs && typeof rawArgs === "object" ? rawArgs : {};
+  const requested = String(args.action || "").trim();
+  const requestedLower = requested.toLowerCase();
+
+  // "volume" without a number is a QUESTION ("volume kitna hai?"), not an
+  // absolute set. Route those to getVolume instead of failing validation.
+  const volumeArg =
+    args.level !== undefined ? args.level : args.volume !== undefined ? args.volume : args.amount;
+  const bareVolumeQuery =
+    (requestedLower === "volume" || requestedLower === "vol" || requestedLower === "setvolume") &&
+    !Number.isFinite(Number(volumeArg));
+
+  if (CLOSE_WINDOW_ACTIONS.has(requested)) return { action: "close", state: null };
+  if (bareVolumeQuery) return { action: "getVolume", state: null };
+
+  // "pause" / "resume" / "stop" ... mean playPause with an EXPLICIT state.
+  const playbackAlias = PLAYBACK_ALIASES.get(requestedLower);
+  if (playbackAlias) return { action: "playPause", state: playbackAlias };
+
+  // Case-insensitive canonical match, so "nextshort" / "NextShort" both work.
+  const canonical =
+    [...BROWSER_ACTIONS].find((name) => name.toLowerCase() === requestedLower) || null;
+  const action =
+    WINDOW_ACTION_ALIASES.get(requested) ||
+    WINDOW_ACTION_ALIASES.get(requestedLower) ||
+    BROWSER_ACTION_ALIASES.get(requestedLower) ||
+    canonical ||
+    requested;
+
+  if (action === "playPause") {
+    // Explicit state wins; a bare "playPause" keeps the historical toggle.
+    return { action, state: normalizePlaybackState(args.state) || "toggle" };
+  }
+  return { action, state: null };
+}
+
 // ---------------------------------------------------------------------------
 // Small helpers
 // ---------------------------------------------------------------------------
@@ -85,6 +224,92 @@ function clampNumber(value, min, max, fallback) {
   const n = typeof value === "number" ? value : Number(value);
   if (!Number.isFinite(n)) return fallback;
   return Math.min(Math.max(Math.round(n), min), max);
+}
+
+/**
+ * Relative seek math (pure). NEVER uses an absolute timestamp: the new position
+ * is currentTime + delta, clamped into [0, duration].
+ */
+function computeSeekTarget(currentTime, deltaSeconds, durationSeconds) {
+  const before = Number.isFinite(Number(currentTime)) ? Math.max(0, Number(currentTime)) : 0;
+  const delta = Number.isFinite(Number(deltaSeconds)) ? Number(deltaSeconds) : 0;
+  const rawDuration = Number(durationSeconds);
+  const duration = Number.isFinite(rawDuration) && rawDuration > 0 ? rawDuration : null;
+
+  let target = before + delta;
+  let clampedToStart = false;
+  let clampedToEnd = false;
+  if (target < 0) {
+    target = 0;
+    clampedToStart = true;
+  }
+  if (duration !== null && target > duration) {
+    target = duration;
+    clampedToEnd = true;
+  }
+  return { from: before, target, duration, clampedToStart, clampedToEnd };
+}
+
+/**
+ * Read a RELATIVE seek request from tool args. Accepts signed seconds, minutes,
+ * or an explicit direction ("back"/"forward"), so "1 minute 30 ahead" and
+ * "25 seconds back" both turn into one signed number.
+ */
+function parseSeekSeconds(args) {
+  const a = args && typeof args === "object" ? args : {};
+  const rawSeconds =
+    a.seconds !== undefined
+      ? a.seconds
+      : a.offset !== undefined
+      ? a.offset
+      : a.value !== undefined
+      ? a.value
+      : a.amount;
+
+  let seconds = Number(rawSeconds);
+  if (!Number.isFinite(seconds)) seconds = 0;
+
+  const minutes = Number(a.minutes);
+  if (Number.isFinite(minutes)) seconds += minutes * 60;
+
+  const direction = String(a.direction || "").toLowerCase();
+  if (["back", "backward", "rewind", "previous", "peeche"].includes(direction)) {
+    seconds = -Math.abs(seconds);
+  }
+  if (["forward", "ahead", "aage"].includes(direction)) {
+    seconds = Math.abs(seconds);
+  }
+
+  const rounded = Math.round(seconds);
+  if (!Number.isFinite(rounded) || rounded === 0) return { ok: false, error: "missingSeekAmount" };
+  if (Math.abs(rounded) > MAX_SEEK_SECONDS) return { ok: false, error: "seekAmountTooLarge" };
+  return { ok: true, seconds: rounded };
+}
+
+/** Relative volume step: 10% by default, clamped to 1..100. */
+function normalizeVolumeStep(args) {
+  const a = args && typeof args === "object" ? args : {};
+  const raw = a.step !== undefined ? a.step : a.amount !== undefined ? a.amount : a.delta;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n === 0) return 10;
+  return Math.min(Math.max(Math.abs(Math.round(n)), 1), MAX_VOLUME_PERCENT);
+}
+
+/** Volume is a 0..100 percentage, clamped. */
+function normalizeVolumeLevel(args) {
+  const a = args && typeof args === "object" ? args : {};
+  const raw = a.level !== undefined ? a.level : a.volume !== undefined ? a.volume : a.amount;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return { ok: false, error: "missingVolumeLevel" };
+  return { ok: true, level: Math.min(Math.max(Math.round(n), 0), MAX_VOLUME_PERCENT) };
+}
+
+function parseShortsState(raw) {
+  try {
+    return JSON.parse(String(raw || "{}"));
+  } catch {
+    return {};
+  }
 }
 
 function capText(value, max) {
@@ -563,6 +788,337 @@ const YT_CONSENT_JS = `(function () {
   return "clicked";
 })()`;
 
+/**
+ * Shared player selection. Shorts first (the ACTIVE reel only, never a
+ * preloaded neighbour), then the real watch-page player, then the most visible
+ * video as a last resort.
+ */
+const PICK_VIDEO_FN = `
+  function pickVisibleArea(el) {
+    if (!el || !el.getBoundingClientRect) return 0;
+    var r = el.getBoundingClientRect();
+    if (!r || r.width < 40 || r.height < 40) return 0;
+    var w = Math.max(0, Math.min(r.right, window.innerWidth) - Math.max(r.left, 0));
+    var h = Math.max(0, Math.min(r.bottom, window.innerHeight) - Math.max(r.top, 0));
+    return w * h;
+  }
+  function pickVideo() {
+    var activeReel = document.querySelector("ytd-reel-video-renderer[is-active] video")
+      || document.querySelector("#shorts-player video");
+    if (activeReel) return { el: activeReel, mode: "shorts" };
+    var main = document.querySelector("#movie_player video.html5-main-video")
+      || document.querySelector("#movie_player video")
+      || document.querySelector("video.html5-main-video");
+    if (main) return { el: main, mode: "video" };
+    var vids = document.querySelectorAll("video");
+    var best = null;
+    var bestArea = 0;
+    for (var i = 0; i < vids.length; i++) {
+      var area = pickVisibleArea(vids[i]);
+      if (area > bestArea) { bestArea = area; best = vids[i]; }
+    }
+    return best ? { el: best, mode: "video" } : null;
+  }
+`;
+
+/**
+ * One in-page script for every player action. Seeking is ALWAYS relative to the
+ * live currentTime and clamped to [0, duration]; no absolute timestamps exist
+ * anywhere in this path.
+ */
+function playerScript(op, params = {}) {
+  const p = params && typeof params === "object" ? params : {};
+  const state = ["play", "pause", "toggle"].includes(String(p.state)) ? String(p.state) : "toggle";
+  const seconds = Number.isFinite(Number(p.seconds)) ? Number(p.seconds) : 0;
+  const level = Number.isFinite(Number(p.level)) ? Number(p.level) : 100;
+  const delta = Number.isFinite(Number(p.delta)) ? Number(p.delta) : 0;
+
+  return `(async function () {
+  ${PICK_VIDEO_FN}
+  var picked = pickVideo();
+  if (!picked) return JSON.stringify({ found: false, error: "noVideoOnPage" });
+  var v = picked.el;
+  var player = document.querySelector("#movie_player");
+  var adShowing = !!(player && player.classList && player.classList.contains("ad-showing"));
+  var op = ${JSON.stringify(op)};
+  var out = { found: true, mode: picked.mode, adShowing: adShowing, title: document.title };
+  function num(x, fallback) { var n = Number(x); return Number.isFinite(n) ? n : fallback; }
+  function pct() { return Math.max(0, Math.min(Math.round(num(v.volume, 1) * 100), 100)); }
+  function remember() { if (v.muted !== true && pct() > 0) window.__myraLastVolume = pct(); }
+  function snapshot() {
+    var dur = num(v.duration, NaN);
+    out.paused = v.paused === true;
+    out.muted = v.muted === true;
+    out.volume = Math.round(num(v.volume, 1) * 100);
+    out.currentTime = Math.round(num(v.currentTime, 0) * 10) / 10;
+    out.duration = Number.isFinite(dur) && dur > 0 ? Math.round(dur * 10) / 10 : null;
+    out.ended = v.ended === true;
+    out.fullscreen = !!document.fullscreenElement;
+    return out;
+  }
+  try {
+    if (op === "state") return JSON.stringify(snapshot());
+    if (op === "playPause") {
+      var wanted = ${JSON.stringify(state)};
+      if (wanted === "play" || (wanted === "toggle" && v.paused)) {
+        var pr = v.play();
+        if (pr && typeof pr.then === "function") {
+          await Promise.race([
+            pr.catch(function () {}),
+            new Promise(function (resolve) { setTimeout(resolve, 2500); })
+          ]);
+        }
+      } else {
+        v.pause();
+      }
+      return JSON.stringify(snapshot());
+    }
+    if (op === "mute") {
+      remember();
+      out.previousVolume = pct();
+      v.muted = true;
+      return JSON.stringify(snapshot());
+    }
+    if (op === "unmute") {
+      var beforeUnmute = pct();
+      v.muted = false;
+      // A YouTube slider at 0 is "silent": restore the last audible level.
+      if (beforeUnmute === 0 && typeof window.__myraLastVolume === "number" && window.__myraLastVolume > 0) {
+        v.volume = Math.min(window.__myraLastVolume, 100) / 100;
+      }
+      out.previousVolume = beforeUnmute;
+      out.restoredVolume = pct();
+      return JSON.stringify(snapshot());
+    }
+    if (op === "setVolume") {
+      var level = ${JSON.stringify(level)};
+      var beforeSet = pct();
+      remember();
+      out.previousVolume = beforeSet;
+      v.volume = Math.max(0, Math.min(level / 100, 1));
+      v.muted = level === 0;
+      if (level > 0) window.__myraLastVolume = level;
+      out.appliedDelta = pct() - beforeSet;
+      return JSON.stringify(snapshot());
+    }
+    if (op === "volumeDelta") {
+      if (adShowing) {
+        out.error = "adPlaying";
+        return JSON.stringify(out);
+      }
+      var beforeVol = pct();
+      var wantedVol = beforeVol + ${JSON.stringify(delta)};
+      var targetVol = Math.max(0, Math.min(wantedVol, 100));
+      out.previousVolume = beforeVol;
+      out.appliedDelta = targetVol - beforeVol;
+      out.clampedAtMin = wantedVol < 0;
+      out.clampedAtMax = wantedVol > 100;
+      v.volume = targetVol / 100;
+      v.muted = targetVol === 0;
+      if (targetVol > 0) window.__myraLastVolume = targetVol;
+      return JSON.stringify(snapshot());
+    }
+    if (op === "getVolume") return JSON.stringify(snapshot());
+    if (op === "restart") {
+      try { v.currentTime = 0; } catch (e) {}
+      var rp = v.play();
+      if (rp && typeof rp.then === "function") {
+        await Promise.race([
+          rp.catch(function () {}),
+          new Promise(function (resolve) { setTimeout(resolve, 2500); })
+        ]);
+      }
+      return JSON.stringify(snapshot());
+    }
+    if (op === "seek") {
+      if (adShowing) {
+        out.error = "adPlaying";
+        return JSON.stringify(out);
+      }
+      var delta = ${JSON.stringify(seconds)};
+      var dur = num(v.duration, NaN);
+      var before = Math.max(0, num(v.currentTime, 0));
+      var target = before + delta;
+      out.clampedToStart = false;
+      out.clampedToEnd = false;
+      if (target < 0) { target = 0; out.clampedToStart = true; }
+      if (Number.isFinite(dur) && dur > 0 && target > dur) { target = dur; out.clampedToEnd = true; }
+      v.currentTime = target;
+      await new Promise(function (resolve) { setTimeout(resolve, 120); });
+      out.fromSeconds = Math.round(before * 10) / 10;
+      out.appliedSeconds = Math.round(delta * 10) / 10;
+      return JSON.stringify(snapshot());
+    }
+    if (op === "fullscreen") {
+      if (!document.fullscreenElement) {
+        var fsTarget = document.querySelector("#movie_player")
+          || document.querySelector("#shorts-player")
+          || document.querySelector("ytd-reel-video-renderer[is-active]")
+          || document.documentElement;
+        try {
+          if (fsTarget && fsTarget.requestFullscreen) await fsTarget.requestFullscreen({ navigationUI: "hide" });
+        } catch (e) {}
+        if (!document.fullscreenElement) {
+          var fsBtn = document.querySelector("button.ytp-fullscreen-button");
+          if (fsBtn) fsBtn.click();
+          await new Promise(function (resolve) { setTimeout(resolve, 500); });
+        }
+      }
+      return JSON.stringify(snapshot());
+    }
+    if (op === "exitFullscreen") {
+      if (document.fullscreenElement) {
+        try { await document.exitFullscreen(); } catch (e) {}
+      }
+      if (document.fullscreenElement) {
+        var exitBtn = document.querySelector("button.ytp-fullscreen-button");
+        if (exitBtn) exitBtn.click();
+        await new Promise(function (resolve) { setTimeout(resolve, 500); });
+      }
+      return JSON.stringify(snapshot());
+    }
+    out.error = "unsupportedPlayerOp";
+    return JSON.stringify(out);
+  } catch (e) {
+    out.error = String((e && e.name) || e);
+    return JSON.stringify(out);
+  }
+})()`;
+}
+
+/** Current Shorts position: URL id, active reel id, reel count, click target. */
+function shortsStateJs() {
+  return `(function () {
+  var onShorts = location.pathname.indexOf("/shorts") === 0;
+  var reels = document.querySelectorAll("ytd-reel-video-renderer");
+  var active = document.querySelector("ytd-reel-video-renderer[is-active]");
+  var activeId = active
+    ? String(active.getAttribute("data-video-id") || active.getAttribute("video-id") || "")
+    : "";
+  var m = location.pathname.match(/\\/shorts\\/([A-Za-z0-9_-]{6,})/);
+  if (!activeId && m) activeId = m[1];
+  var holder = document.querySelector("#shorts-player")
+    || document.querySelector("ytd-reel-video-renderer[is-active]")
+    || document.querySelector("ytd-shorts");
+  var rect = null;
+  if (holder && holder.getBoundingClientRect) {
+    var r = holder.getBoundingClientRect();
+    if (r.width > 40 && r.height > 40) {
+      rect = { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+    }
+  }
+  if (!rect) rect = { x: Math.round(window.innerWidth / 2), y: Math.round(window.innerHeight / 2) };
+  return JSON.stringify({
+    onShorts: onShorts,
+    activeId: activeId,
+    count: reels.length,
+    videoCount: document.querySelectorAll("video").length,
+    rect: rect,
+    url: location.href,
+    title: document.title
+  });
+})()`;
+}
+
+/** On-screen Shorts navigation buttons (last-resort fallback). */
+function shortsButtonJs(direction) {
+  return `(function () {
+  var d = ${JSON.stringify(direction === "up" ? "up" : "down")};
+  var selectors = d === "up"
+    ? ["#navigation-button-up button", "button[aria-label*='Previous']", "button[aria-label*='previous']"]
+    : ["#navigation-button-down button", "button[aria-label*='Next']", "button[aria-label*='next']"];
+  for (var i = 0; i < selectors.length; i++) {
+    var el = document.querySelector(selectors[i]);
+    if (el) {
+      el.click();
+      return JSON.stringify({ clicked: true, selector: selectors[i] });
+    }
+  }
+  return JSON.stringify({ clicked: false });
+})()`;
+}
+
+/**
+ * Move one Short, verified by an observable change of the active reel/URL.
+ * Three mechanisms, most-human first: trusted wheel, trusted arrow key, then the
+ * on-screen navigation button. Success is never assumed.
+ */
+async function driveShortsStep(pageApi, direction, options = {}) {
+  const dir = direction === "up" ? "up" : "down";
+  const settleMs = Number.isFinite(Number(options.settleMs)) ? Number(options.settleMs) : 350;
+  const timeoutMs = Number.isFinite(Number(options.timeoutMs)) ? Number(options.timeoutMs) : 2600;
+
+  const read = async () => parseShortsState(await pageApi.evaluate(shortsStateJs()));
+  const before = await read();
+  if (!before.onShorts) return { ok: false, error: "notOnShorts", direction: dir };
+
+  const beforeKey = String(before.activeId || before.url || "");
+  const waitForChange = async (maxMs) => {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < maxMs) {
+      const state = await read();
+      const key = String(state.activeId || state.url || "");
+      if (key && key !== beforeKey) return { changed: true, state };
+      await sleep(250);
+    }
+    const state = await read();
+    const key = String(state.activeId || state.url || "");
+    return { changed: Boolean(key && key !== beforeKey), state };
+  };
+
+  const rect = before.rect && before.rect.x > 0 ? before.rect : { x: 400, y: 300 };
+
+  // 1) Trusted wheel over the Shorts surface.
+  await pageApi.send("Input.dispatchMouseEvent", {
+    type: "mouseWheel",
+    x: rect.x,
+    y: rect.y,
+    deltaX: 0,
+    deltaY: dir === "up" ? -900 : 900,
+    button: "none",
+  });
+  await sleep(settleMs);
+  let hit = await waitForChange(timeoutMs);
+  if (hit.changed) {
+    return { ok: true, direction: dir, method: "wheel", activeId: hit.state.activeId || "", url: hit.state.url || "", title: hit.state.title || "" };
+  }
+
+  // 2) Trusted arrow key (Shorts' native previous/next shortcut).
+  const key = dir === "up" ? "ArrowUp" : "ArrowDown";
+  const keyCode = dir === "up" ? 38 : 40;
+  await pageApi.send("Input.dispatchKeyEvent", {
+    type: "keyDown", key, code: key, windowsVirtualKeyCode: keyCode, nativeVirtualKeyCode: keyCode,
+  });
+  await pageApi.send("Input.dispatchKeyEvent", { type: "keyUp", key, code: key, windowsVirtualKeyCode: keyCode, nativeVirtualKeyCode: keyCode });
+  await sleep(settleMs);
+  hit = await waitForChange(timeoutMs);
+  if (hit.changed) {
+    return { ok: true, direction: dir, method: "keyboard", activeId: hit.state.activeId || "", url: hit.state.url || "", title: hit.state.title || "" };
+  }
+
+  // 3) On-screen navigation button.
+  const button = parseShortsState(await pageApi.evaluate(shortsButtonJs(dir)));
+  if (button.clicked) {
+    await sleep(settleMs);
+    hit = await waitForChange(timeoutMs);
+    if (hit.changed) {
+      return { ok: true, direction: dir, method: "button", activeId: hit.state.activeId || "", url: hit.state.url || "", title: hit.state.title || "" };
+    }
+  }
+
+  return {
+    ok: false,
+    error: dir === "up" ? "noPreviousShort" : "noNextShort",
+    direction: dir,
+    changed: false,
+    activeId: hit.state.activeId || before.activeId || "",
+    detail:
+      dir === "up"
+        ? "The feed did not move up; this may already be the first Short."
+        : "No next Short appeared; the feed may be at its end or still loading.",
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Controller
 // ---------------------------------------------------------------------------
@@ -1010,6 +1566,25 @@ function createBrowserController({ audit, userDataDir, log } = {}) {
   async function actionScroll(args) {
     const p = await getPage();
     const direction = args.direction === "up" ? "up" : "down";
+
+    // On Shorts, a "scroll" is the next/previous Short — never a timeline seek.
+    const shorts = await readShortsState(p);
+    if (shorts.onShorts) {
+      const step = await driveShortsStep(p, direction);
+      if (!step.ok) {
+        return { ok: false, action: "scroll", mode: "shorts", direction, error: step.error, detail: step.detail };
+      }
+      return {
+        ok: true,
+        action: "scroll",
+        mode: "shorts",
+        direction,
+        method: step.method,
+        activeId: step.activeId,
+        url: capText(step.url, MAX_URL_LENGTH),
+      };
+    }
+
     const amount = clampNumber(args.amount, 100, MAX_SCROLL_PX, DEFAULT_SCROLL_PX);
     const delta = direction === "up" ? -amount : amount;
 
@@ -1072,54 +1647,219 @@ function createBrowserController({ audit, userDataDir, log } = {}) {
 
   async function actionPlayPause(args) {
     const p = await getPage();
-    const wanted = args.state === "play" || args.state === "pause" ? args.state : "toggle";
+    const wanted = normalizePlaybackState(args.state) || "toggle";
     // Only the real watch-page player counts. Search pages also contain hover
     // preview <video> elements, and pausing one of those is not "pause the
     // video" from the user's point of view.
-    const raw = await p.evaluate(
-      `(async function () {
-        var onWatch = location.pathname.indexOf("/watch") === 0;
-        var v = document.querySelector("#movie_player video");
-        if (!v && onWatch) v = document.querySelector("video");
-        if (!v) return JSON.stringify({ found: false });
-        var wanted = ${JSON.stringify(wanted)};
-        try {
-          if (wanted === "play" || (wanted === "toggle" && v.paused)) {
-            var p = v.play();
-            // play() can stay pending forever (autoplay policy / buffering), so
-            // it is bounded here instead of hanging the whole tool call.
-            if (p && typeof p.then === "function") {
-              await Promise.race([
-                p.catch(function () {}),
-                new Promise(function (resolve) { setTimeout(resolve, 2500); })
-              ]);
-            }
-          } else {
-            v.pause();
-          }
-        } catch (e) {
-          return JSON.stringify({ found: true, error: String((e && e.name) || e) });
-        }
-        return JSON.stringify({
-          found: true,
-          paused: v.paused,
-          currentTime: Math.round(v.currentTime || 0),
-          title: document.title
-        });
-      })()`
-    );
+    const raw = await p.evaluate(playerScript("playPause", { state: wanted }));
     let info = {};
     try {
       info = JSON.parse(String(raw || "{}"));
     } catch {
       /* ignore */
     }
-    if (!info.found) return { ok: false, error: "noVideoOnPage" };
-    if (info.error) return { ok: false, error: "playbackBlocked", detail: info.error };
+    if (!info.found) {
+      record("BROWSER_ACTION_FAILED", { tool: "playPause", reason: "noVideoOnPage" });
+      return { ok: false, error: "noVideoOnPage" };
+    }
+    if (info.error) {
+      record("BROWSER_ACTION_FAILED", { tool: "playPause", reason: String(info.error).slice(0, 40) });
+      return { ok: false, error: "playbackBlocked", detail: info.error };
+    }
     return {
       ok: true,
       action: "playPause",
       state: info.paused ? "paused" : "playing",
+      title: capText(info.title, MAX_TITLE_LEN),
+    };
+  }
+
+  // --- YouTube Shorts / playback -------------------------------------------
+
+  async function readShortsState(p) {
+    return parseShortsState(await p.evaluate(shortsStateJs()));
+  }
+
+  async function waitForShortsReady(p, timeoutMs) {
+    const startedAt = Date.now();
+    let state = await readShortsState(p);
+    while (Date.now() - startedAt < timeoutMs) {
+      if (state.onShorts && (state.activeId || state.videoCount > 0)) return state;
+      await sleep(300);
+      state = await readShortsState(p);
+    }
+    return state;
+  }
+
+  async function actionOpenShorts() {
+    const check = validateNavigationUrl(SHORTS_URL);
+    if (!check.ok) return { ok: false, action: "openShorts", error: check.reason };
+
+    const p = await getPage();
+    await p.send("Page.navigate", { url: check.url });
+    await waitForReady(p);
+    const state = await waitForShortsReady(p, 10000);
+    const snapshot = await readPage(p).catch(() => ({ url: check.url, title: "" }));
+
+    if (!state.onShorts) {
+      return { ok: false, action: "openShorts", error: "shortsNotLoaded", url: capText(snapshot.url || check.url, MAX_URL_LENGTH) };
+    }
+    return {
+      ok: true,
+      action: "openShorts",
+      url: capText(snapshot.url || check.url, MAX_URL_LENGTH),
+      title: capText(snapshot.title, MAX_TITLE_LEN),
+      shortsReady: Boolean(state.activeId || state.videoCount),
+      count: Number(state.count) || 0,
+    };
+  }
+
+  async function actionShortStep(direction) {
+    const dir = direction === "up" ? "up" : "down";
+    const action = dir === "up" ? "previousShort" : "nextShort";
+    const p = await getPage();
+
+    let state = await readShortsState(p);
+    if (!state.onShorts) {
+      const check = validateNavigationUrl(SHORTS_URL);
+      if (!check.ok) return { ok: false, action, error: check.reason };
+      await p.send("Page.navigate", { url: check.url });
+      await waitForReady(p);
+      state = await waitForShortsReady(p, 10000);
+      if (!state.onShorts) return { ok: false, action, error: "shortsNotLoaded" };
+    } else if (!state.activeId && !state.videoCount) {
+      state = await waitForShortsReady(p, 6000);
+    }
+
+    const result = await driveShortsStep(p, dir);
+    if (!result.ok) {
+      return {
+        ok: false,
+        action,
+        direction: dir,
+        error: result.error,
+        detail: result.detail,
+        activeId: result.activeId,
+      };
+    }
+    return {
+      ok: true,
+      action,
+      direction: dir,
+      method: result.method,
+      activeId: result.activeId,
+      url: capText(result.url, MAX_URL_LENGTH),
+      title: capText(result.title, MAX_TITLE_LEN),
+    };
+  }
+
+  async function actionSeek(args) {
+    const parsed = parseSeekSeconds(args);
+    if (!parsed.ok) return { ok: false, action: "seek", error: parsed.error };
+
+    const p = await getPage();
+    const info = parseShortsState(await p.evaluate(playerScript("seek", { seconds: parsed.seconds })));
+    if (!info.found) return { ok: false, action: "seek", error: "noVideoOnPage" };
+    if (info.error === "adPlaying") {
+      return {
+        ok: false,
+        action: "seek",
+        error: "adPlaying",
+        detail: "An ad is playing; its timeline is not the video the user asked to seek.",
+      };
+    }
+    if (info.error) return { ok: false, action: "seek", error: "seekFailed", detail: String(info.error) };
+
+    const duration = Number(info.duration) > 0 ? Number(info.duration) : null;
+    return {
+      ok: true,
+      action: "seek",
+      mode: info.mode,
+      appliedSeconds: parsed.seconds,
+      fromSeconds: Number(info.fromSeconds) || 0,
+      toSeconds: Number(info.currentTime) || 0,
+      durationSeconds: duration,
+      clampedToStart: info.clampedToStart === true,
+      clampedToEnd: info.clampedToEnd === true,
+      paused: info.paused === true,
+      title: capText(info.title, MAX_TITLE_LEN),
+    };
+  }
+
+  async function actionAudio(kind, args) {
+    let level;
+    let delta;
+
+    if (kind === "setVolume") {
+      const vol = normalizeVolumeLevel(args);
+      if (!vol.ok) return { ok: false, action: kind, error: vol.error };
+      level = vol.level;
+    } else if (kind === "increaseVolume" || kind === "decreaseVolume") {
+      const step = normalizeVolumeStep(args);
+      delta = kind === "increaseVolume" ? step : -step;
+    }
+
+    const p = await getPage();
+    const op = kind === "increaseVolume" || kind === "decreaseVolume" ? "volumeDelta" : kind;
+    const info = parseShortsState(
+      await p.evaluate(playerScript(op, { level, delta: delta === undefined ? 0 : delta }))
+    );
+    if (!info.found) return { ok: false, action: kind, error: "noVideoOnPage" };
+    if (info.error) return { ok: false, action: kind, error: "audioControlFailed", detail: String(info.error) };
+
+    const volume = Number(info.volume);
+    return {
+      ok: true,
+      action: kind,
+      mode: info.mode,
+      // The player's OWN volume, read back after the change — never assumed.
+      volume,
+      muted: info.muted === true,
+      previousVolume: Number.isFinite(Number(info.previousVolume)) ? Number(info.previousVolume) : null,
+      appliedDelta: Number.isFinite(Number(info.appliedDelta)) ? Number(info.appliedDelta) : null,
+      restoredVolume: Number.isFinite(Number(info.restoredVolume)) ? Number(info.restoredVolume) : null,
+      atMin: volume === 0,
+      atMax: volume === MAX_VOLUME_PERCENT,
+      paused: info.paused === true,
+      title: capText(info.title, MAX_TITLE_LEN),
+    };
+  }
+
+  async function actionFullscreen(enter) {
+    const action = enter ? "fullscreen" : "exitFullscreen";
+    const p = await getPage();
+    const info = parseShortsState(await p.evaluate(playerScript(enter ? "fullscreen" : "exitFullscreen")));
+    if (!info.found) return { ok: false, action, error: "noVideoOnPage" };
+    if (info.error) return { ok: false, action, error: "fullscreenFailed", detail: String(info.error) };
+
+    const fullscreen = info.fullscreen === true;
+    if (enter && !fullscreen) {
+      return {
+        ok: false,
+        action,
+        error: "fullscreenBlocked",
+        detail: "The page did not enter fullscreen; the browser may require a direct click.",
+      };
+    }
+    if (!enter && fullscreen) {
+      return { ok: false, action, error: "exitFullscreenBlocked", detail: "The page is still fullscreen." };
+    }
+    return { ok: true, action, mode: info.mode, fullscreen, title: capText(info.title, MAX_TITLE_LEN) };
+  }
+
+  async function actionRestart() {
+    const p = await getPage();
+    const info = parseShortsState(await p.evaluate(playerScript("restart")));
+    if (!info.found) return { ok: false, action: "restart", error: "noVideoOnPage" };
+    if (info.error) return { ok: false, action: "restart", error: "restartFailed", detail: String(info.error) };
+    return {
+      ok: true,
+      action: "restart",
+      mode: info.mode,
+      fromSeconds: 0,
+      toSeconds: Number(info.currentTime) || 0,
+      durationSeconds: Number(info.duration) > 0 ? Number(info.duration) : null,
+      paused: info.paused === true,
       title: capText(info.title, MAX_TITLE_LEN),
     };
   }
@@ -1382,11 +2122,13 @@ function createBrowserController({ audit, userDataDir, log } = {}) {
   async function run(rawArgs) {
     const args = rawArgs && typeof rawArgs === "object" ? rawArgs : {};
     const requested = String(args.action || "").trim();
-    const action = CLOSE_WINDOW_ACTIONS.has(requested)
-      ? "close"
-      : WINDOW_ACTION_ALIASES.get(requested) || requested;
+    const { action, state: playbackState } = resolveBrowserAction(args);
 
     if (!BROWSER_ACTIONS.has(action)) {
+      record("BROWSER_ACTION_FAILED", {
+        tool: capText(requested, 40),
+        reason: "unsupportedAction",
+      });
       return { ok: false, error: "unsupportedAction", action: capText(requested, 40) };
     }
 
@@ -1405,7 +2147,33 @@ function createBrowserController({ audit, userDataDir, log } = {}) {
         case "scroll":
           return await actionScroll(args);
         case "playPause":
-          return await actionPlayPause(args);
+          return await actionPlayPause({ ...args, state: playbackState || args.state });
+        case "openShorts":
+          return await actionOpenShorts();
+        case "nextShort":
+          return await actionShortStep("down");
+        case "previousShort":
+          return await actionShortStep("up");
+        case "seek":
+          return await actionSeek(args);
+        case "mute":
+          return await actionAudio("mute", args);
+        case "unmute":
+          return await actionAudio("unmute", args);
+        case "setVolume":
+          return await actionAudio("setVolume", args);
+        case "increaseVolume":
+          return await actionAudio("increaseVolume", args);
+        case "decreaseVolume":
+          return await actionAudio("decreaseVolume", args);
+        case "getVolume":
+          return await actionAudio("getVolume", args);
+        case "fullscreen":
+          return await actionFullscreen(true);
+        case "exitFullscreen":
+          return await actionFullscreen(false);
+        case "restart":
+          return await actionRestart();
         case "back":
           return await actionBack();
         case "closeTab":
@@ -1463,4 +2231,16 @@ module.exports = {
   isPrivateOrLoopbackHost,
   BROWSER_ACTIONS,
   CLOSE_WINDOW_ACTIONS,
+  SHORTS_URL,
+  // Exposed for tests: the EXACT production helpers and in-page scripts.
+  computeSeekTarget,
+  parseSeekSeconds,
+  normalizeVolumeLevel,
+  normalizeVolumeStep,
+  normalizePlaybackState,
+  resolveBrowserAction,
+  playerScript,
+  shortsStateJs,
+  shortsButtonJs,
+  driveShortsStep,
 };

@@ -7,6 +7,8 @@ import {
   Trash2,
   FolderTree,
   FileCode,
+  FileText,
+  X,
   Folder,
   Check,
   AlertCircle,
@@ -105,12 +107,50 @@ function describeToolResult(name: string, args: any, output: any, failed: boolea
       return `Project: ${action}`;
     }
     case "browserControl": {
-      const action = String(args?.action ?? "");
+      // Prefer the canonical action the controller actually ran: the model may
+      // have sent a phrasing like "pause" that resolves to "playPause".
+      const action = String(output?.action ?? args?.action ?? "");
+      const clock = (total: unknown) => {
+        const n = Math.max(0, Math.round(Number(total) || 0));
+        return `${Math.floor(n / 60)}:${String(n % 60).padStart(2, "0")}`;
+      };
       if (action === "search") return `YouTube "${args?.query ?? ""}" → ${output?.count ?? 0} results`;
       if (action === "listVideos") return `${output?.count ?? 0} videos on page`;
       if (action === "clickVideo") return `Playing: ${output?.title ?? args?.query ?? "video"}`;
       if (action === "playPause") return `Playback ${output?.state ?? "toggled"}`;
-      if (action === "scroll") return `Scrolled ${output?.direction ?? "down"} → y=${output?.scrollY ?? 0}`;
+      if (action === "openShorts") return `Shorts feed${output?.shortsReady ? " ready" : " opened"}`;
+      if (action === "nextShort" || action === "previousShort") {
+        return output?.ok
+          ? `Shorts: ${action === "nextShort" ? "next" : "previous"}${output?.method ? ` (${output.method})` : ""}`
+          : `Shorts: ${output?.error ?? "not moved"}`;
+      }
+      if (action === "seek") {
+        return output?.ok
+          ? `Seek ${Number(output.appliedSeconds) > 0 ? "+" : ""}${output.appliedSeconds}s → ${clock(output.toSeconds)} / ${clock(output.durationSeconds)}`
+          : `Seek failed: ${output?.error ?? "unknown"}`;
+      }
+      if (action === "setVolume") return `Volume ${output?.volume ?? "?"}%`;
+      if (action === "increaseVolume" || action === "decreaseVolume") {
+        const delta = Number(output?.appliedDelta) || 0;
+        const sign = delta > 0 ? "+" : "";
+        return output?.ok
+          ? `Volume ${sign}${delta}% → ${output?.volume ?? "?"}%`
+          : `Volume change failed: ${output?.error ?? "unknown"}`;
+      }
+      if (action === "getVolume") return `Volume ${output?.volume ?? "?"}%${output?.muted ? " (muted)" : ""}`;
+      if (action === "mute") return `Audio muted${output?.previousVolume != null ? ` at ${output.previousVolume}%` : ""}`;
+      if (action === "unmute") {
+        return `Audio on${output?.restoredVolume != null ? ` at ${output.restoredVolume}%` : ""}`;
+      }
+      if (action === "fullscreen" || action === "exitFullscreen") {
+        return output?.fullscreen ? "Fullscreen" : "Windowed";
+      }
+      if (action === "restart") return `Restarted from 0:00`;
+      if (action === "scroll") {
+        return output?.mode === "shorts"
+          ? `Shorts scrolled ${output?.direction ?? "down"}`
+          : `Scrolled ${output?.direction ?? "down"} → y=${output?.scrollY ?? 0}`;
+      }
       if (action === "open") return `Opened ${output?.title || output?.url || "page"}`;
       return `Browser: ${action || "action"}`;
     }
@@ -127,6 +167,24 @@ function describeToolResult(name: string, args: any, output: any, failed: boolea
       if (action === "open") return `Opened Phone Link`;
       return `Phone Link: ${action}`;
     }
+    case "fileControl": {
+      const action = String(args?.action ?? "");
+      if (action === "pick") {
+        return output?.pickerOpened ? "File picker opened" : `Opened ${output?.name ?? "file"}`;
+      }
+      if (action === "list") return `${output?.count ?? 0} file(s) in context`;
+      if (action === "compare") return `Compared ${output?.files?.length ?? 0} files`;
+      if (action === "close" || action === "closeAll") {
+        return output?.closed ? `Closed ${output.closed}` : "File context cleared";
+      }
+      if (action === "search") {
+        return `${output?.totalMatches ?? 0} match(es) in ${output?.name ?? "file"}`;
+      }
+      if (output?.name) {
+        return `${output.name} — ${output.chunkChars ?? 0}/${output.totalChars ?? 0} chars`;
+      }
+      return `File: ${action || "action"}`;
+    }
     default:
       return `${name} done`;
   }
@@ -138,6 +196,7 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [executedTools, setExecutedTools] = useState<ExecutedTool[]>([]);
   const [projectState, setProjectState] = useState<ProjectBuilderState>({});
+  const [fileState, setFileState] = useState<any>(null);
   const [latency, setLatency] = useState<number | null>(null);
   const [sessionSeconds, setSessionSeconds] = useState<number>(0);
   const [quoteIndex, setQuoteIndex] = useState<number>(0);
@@ -226,6 +285,38 @@ export default function App() {
       disconnectSession();
     };
   }, []);
+
+  // Desktop file bridge: reflect the file currently open for this conversation.
+  // The preload API returns metadata only — never file contents.
+  useEffect(() => {
+    const api = (window as any).myraDesktop?.fileAccess;
+    if (!api) return;
+    let alive = true;
+    api.state?.().then((s: any) => {
+      if (alive && s) setFileState(s);
+    }).catch(() => {});
+    const unsubscribe = api.onState?.((s: any) => setFileState(s));
+    return () => {
+      alive = false;
+      if (typeof unsubscribe === "function") unsubscribe();
+    };
+  }, []);
+
+  const openFileFromDesktop = () => {
+    const api = (window as any).myraDesktop?.fileAccess;
+    if (!api?.pick) return;
+    api.pick().then((s: any) => {
+      if (s) setFileState(s);
+    }).catch(() => {});
+  };
+
+  const closeFileContext = () => {
+    const api = (window as any).myraDesktop?.fileAccess;
+    if (!api?.close) return;
+    api.close().then((s: any) => {
+      if (s) setFileState(s);
+    }).catch(() => {});
+  };
 
   const disconnectSession = () => {
     setState("disconnected");
@@ -638,6 +729,70 @@ export default function App() {
 
       {/* VS Code Project Builder HUD & Action Trigger HUD */}
       <div className="relative w-full max-w-lg mx-auto z-20 mb-6 flex flex-col gap-3" id="interactive-hud-panel">
+        {/* Current File Context */}
+        <AnimatePresence>
+          {(fileState?.active || fileState?.status === "reading" || fileState?.lastError) && (
+            <motion.div
+              initial={{ opacity: 0, y: 20, scale: 0.96 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.96 }}
+              className="glass-panel rounded-2xl p-4 flex flex-col gap-2 shadow-xl border border-amber-500/25 bg-slate-900/90 backdrop-blur-xl"
+              id="file-context-panel"
+            >
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex items-center gap-2.5 min-w-0">
+                  {fileState?.status === "reading" ? (
+                    <div className="w-4 h-4 border-2 border-t-transparent border-amber-400 rounded-full animate-spin shrink-0" />
+                  ) : (
+                    <FileText className="w-4 h-4 text-amber-400 shrink-0" />
+                  )}
+                  <div className="min-w-0">
+                    <p className="font-mono text-[9px] uppercase tracking-wider text-slate-400">
+                      {fileState?.status === "reading" ? "Reading file…" : "Current File"}
+                    </p>
+                    <p className="text-xs font-medium text-slate-100 truncate">
+                      {fileState?.active?.name ?? "Waiting for selection…"}
+                    </p>
+                    {fileState?.active && (
+                      <p className="text-[9px] font-mono text-slate-500 mt-0.5">
+                        {fileState.active.kind} · {fileState.active.charCount} chars · {fileState.active.lineCount} lines
+                        {fileState.active.truncated ? " · truncated" : ""}
+                        {fileState.active.sensitive ? " · sensitive" : ""}
+                      </p>
+                    )}
+                  </div>
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  <button
+                    onClick={openFileFromDesktop}
+                    className="text-[9px] font-mono uppercase tracking-wider text-amber-300 border border-amber-500/40 bg-amber-950/40 px-2 py-1 rounded-lg hover:bg-amber-900/40 transition-colors"
+                  >
+                    Open file
+                  </button>
+                  <button
+                    onClick={closeFileContext}
+                    className="w-7 h-7 rounded-lg border border-white/10 flex items-center justify-center text-slate-400 hover:text-slate-100 hover:bg-white/5 transition-colors"
+                    title="Close file context"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              </div>
+              {fileState?.lastError && (
+                <p className="text-[10px] text-red-300 bg-red-950/40 border border-red-500/30 rounded-lg px-2 py-1.5 flex items-center gap-1.5">
+                  <AlertCircle className="w-3 h-3 shrink-0" />
+                  {fileState.lastError}
+                </p>
+              )}
+              {(fileState?.open?.length ?? 0) > 1 && (
+                <p className="text-[9px] font-mono text-slate-500">
+                  {fileState.open.length} files in context — say "switch to …" or "compare these files".
+                </p>
+              )}
+            </motion.div>
+          )}
+        </AnimatePresence>
+
         {/* VS Code Project Builder HUD */}
         <AnimatePresence>
           {(projectState.activePlan || projectState.lastApplied || projectState.activeProject) && (
@@ -803,6 +958,8 @@ export default function App() {
                         <Clock className="w-3.5 h-3.5 text-cyan-400" />
                       ) : tool.name === "projectControl" ? (
                         <FolderTree className="w-3.5 h-3.5 text-emerald-400" />
+                      ) : tool.name === "fileControl" ? (
+                        <FileText className="w-3.5 h-3.5 text-amber-400" />
                       ) : (
                         <Globe className="w-3.5 h-3.5 text-purple-400" />
                       )}
@@ -850,6 +1007,14 @@ export default function App() {
 
         {/* Column 3: Control Buttons */}
         <div className="flex items-center justify-center md:justify-end space-x-4">
+          <button
+            onClick={openFileFromDesktop}
+            className="w-10 h-10 rounded-xl glass-panel border border-white/10 flex items-center justify-center text-slate-400 hover:text-amber-200 hover:bg-white/5 transition-all shadow-sm"
+            title="Open a file for Myra"
+            id="open-file-btn"
+          >
+            <FileText className="w-4 h-4" />
+          </button>
           <button 
             onClick={handleToggle}
             className={`px-5 py-2 rounded-xl border font-mono text-[10px] font-bold tracking-widest transition-all duration-300 flex items-center gap-2 shadow-sm ${
