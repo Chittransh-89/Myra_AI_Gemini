@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, viewport-fit=cover"
+    />
+    <meta name="theme-color" content="#020617" />
+    <meta name="color-scheme" content="dark" />
+    <title>Myra Remote</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        min-height: 100%;
+        background: #020617;
+        color: #e2e8f0;
+        font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+      }
+      #myra-boot {
+        min-height: 100vh;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 0.75rem;
+        padding: 1.5rem;
+        text-align: center;
+        font-size: 0.85rem;
+        color: #94a3b8;
+      }
+      #myra-boot .dot {
+        width: 0.5rem;
+        height: 0.5rem;
+        border-radius: 9999px;
+        background: #22d3ee;
+        animation: myra-pulse 1.4s ease-in-out infinite;
+      }
+      #myra-boot a {
+        color: #a5f3fc;
+        border: 1px solid rgba(34, 211, 238, 0.4);
+        border-radius: 0.75rem;
+        padding: 0.55rem 1rem;
+        text-decoration: none;
+      }
+      @keyframes myra-pulse {
+        0%,
+        100% {
+          opacity: 0.25;
+        }
+        50% {
+          opacity: 1;
+        }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        #myra-boot .dot {
+          animation: none;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root">
+      <div id="myra-boot">
+        <span class="dot" aria-hidden="true"></span>
+        <span>Connecting to Myra…</span>
+      </div>
+    </div>
+    <noscript>
+      <div id="myra-boot">
+        Myra Remote needs JavaScript. Enable it in your browser and reload.
+      </div>
+    </noscript>
+    <script>
+      // Early failure guard: if the entry module throws while loading (for
+      // example a stale server process, a stale build, or a path prefix that
+      // breaks asset URLs), show a readable message with the failing file
+      // instead of leaving an empty page. Once React replaces the boot
+      // placeholder this listener is a no-op.
+      (function () {
+        var shown = false;
+
+        function showBootFailure(detail) {
+          var boot = document.getElementById("myra-boot");
+          if (!boot || shown) return;
+          shown = true;
+          boot.innerHTML =
+            '<span style="font-size:.7rem;letter-spacing:.2em;text-transform:uppercase;color:#22d3ee">Myra Remote</span>' +
+            '<strong style="color:#e2e8f0;font-size:1rem">The dashboard could not start</strong>' +
+            '<span style="max-width:20rem;line-height:1.6;font-size:.8rem">The PC page loaded, but its script failed. Fully quit and reopen the Myra app on the PC so the server reloads, then reload this page.</span>' +
+            (detail
+              ? '<code style="max-width:20rem;word-break:break-all;font-size:.7rem;color:#fca5a5">' + detail + "</code>"
+              : "") +
+            '<a href="/remote" onclick="location.reload(true);return false">Reload</a>';
+        }
+
+        function errorDetail(event) {
+          var target = event && event.target;
+          if (target && target.tagName === "SCRIPT") {
+            var src = target.src || "entry script";
+            try {
+              src = new URL(src, location.href).pathname;
+            } catch (e) {
+              /* keep the raw value */
+            }
+            return "Script failed to load: " + src;
+          }
+          if (event && event.message) return String(event.message).slice(0, 160);
+          return "";
+        }
+
+        window.addEventListener(
+          "error",
+          function (event) {
+            // Ignore unrelated resource errors (fonts/images). Only an
+            // uncaught exception or a failed script should replace the page.
+            if (event && event.target && event.target.tagName && event.target.tagName !== "SCRIPT") return;
+            showBootFailure(errorDetail(event));
+          },
+          true
+        );
+        window.addEventListener("unhandledrejection", function (event) {
+          var reason = event && event.reason;
+          showBootFailure(reason ? String(reason.message || reason).slice(0, 160) : "");
+        });
+      })();
+    </script>
+    <script type="module" src="/src/remote/main.tsx"></script>
+  </body>
+</html>

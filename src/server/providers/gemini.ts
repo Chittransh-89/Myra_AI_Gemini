@@ -170,6 +170,26 @@ class GeminiSession implements AIProviderSession {
     }
   }
 
+  sendText(text: string): void {
+    if (!this.session) return;
+    const value = String(text ?? "").trim();
+    if (!value) return;
+    try {
+      // sendClientContent exists on GeminiLive sessions. Guarded so an SDK
+      // change can never break the audio path.
+      if (typeof this.session.sendClientContent !== "function") {
+        console.warn("[GeminiSession] This SDK does not support text turns");
+        return;
+      }
+      this.session.sendClientContent({
+        turns: [{ role: "user", parts: [{ text: value }] }],
+        turnComplete: true,
+      });
+    } catch (err) {
+      console.error("[GeminiSession] Error sending text turn:", sanitizeLogText(err));
+    }
+  }
+
   close(): void {
     if (!this.session) return;
     try {
@@ -226,6 +246,10 @@ export class GeminiProvider implements AIProvider {
       },
       systemInstruction: config.systemInstruction,
       tools: geminiTools,
+      // Interview Mode records a spoken session via the SAME pipeline. These
+      // are additive; the audio in/out behaviour is unchanged.
+      inputAudioTranscription: {},
+      outputAudioTranscription: {},
     };
 
     // Establish the Gemini Live WebSocket session.
@@ -253,6 +277,21 @@ export class GeminiProvider implements AIProvider {
 
             if (turnComplete) {
               callbacks.onTurnComplete();
+            }
+
+            // Optional speech transcription (Interview Mode). Absent for
+            // providers/models that do not supply it.
+            const inputText =
+              message.serverContent.inputTranscription?.text ??
+              message.serverContent.inputTranscription?.transcript;
+            if (typeof inputText === "string" && inputText.trim() && callbacks.onTranscript) {
+              callbacks.onTranscript("user", inputText.trim());
+            }
+            const outputText =
+              message.serverContent.outputTranscription?.text ??
+              message.serverContent.outputTranscription?.transcript;
+            if (typeof outputText === "string" && outputText.trim() && callbacks.onTranscript) {
+              callbacks.onTranscript("model", outputText.trim());
             }
           }
 

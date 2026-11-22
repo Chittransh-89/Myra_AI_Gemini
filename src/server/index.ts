@@ -37,6 +37,14 @@ import {
 import type { ToolHandoff, CompletionReceipt } from "./handoff.js";
 import type { AIProvider, AIProviderSession, FunctionResponse } from "./providers/index.js";
 import type { ServerConfig } from "./config.js";
+import type { ViteDevServer } from "vite";
+import { PairingManager } from "./remote/pairing.js";
+import { RemoteRuntime } from "./remote/runtime.js";
+import { RemoteAudioBridge } from "./remote/audioBridge.js";
+import { createRemoteRouter, createRemoteWebSocketServer } from "./remote/routes.js";
+import { IntelligenceService } from "./intelligence/service.js";
+import { createIntelligenceRouter } from "./intelligence/routes.js";
+import { GeminiTextModel } from "./intelligence/model.js";
 
 // ---------------------------------------------------------------------------
 // T5R Phase B: direct completion constants
@@ -53,6 +61,8 @@ const MAIN_EXECUTED_TOOLS = new Set<string>([
   "phoneControl",
   "projectControl",
   "fileControl",
+  "appControl",
+  "taskControl",
 ]);
 
 // A tool-call id must be usable as a registry key and an audit field.
@@ -62,6 +72,12 @@ const REGISTRY_ID_RX = /^[A-Za-z0-9_:.-]{1,128}$/;
 // Authoritative for completion acceptance; wall-clock receipt timestamps are
 // informational only.
 const SERVER_REGISTRATION_TTL_MS = 30_000;
+
+// A multi-step desktop task legitimately runs for minutes. Its registration must
+// outlive the task runner's own whole-task deadline (150s), otherwise a task
+// that actually succeeded would be dropped as COMPLETION_EXPIRED.
+const LONG_RUNNING_REGISTRATION_TTL_MS = 180_000;
+const LONG_RUNNING_TOOLS = new Set<string>(["taskControl"]);
 
 // Bounded consumed-nonce replay cache (defense-in-depth subordinate to the
 // terminal-state check).
@@ -89,13 +105,24 @@ interface ConnectionContext {
 // These were inline in the original server.ts — now isolated here for clarity.
 // ---------------------------------------------------------------------------
 
-const MYRA_SYSTEM_INSTRUCTION = `You are Myraa, a young, confident, witty, and charming female AI assistant. 
-You are playful, energetic, engaging, smart, emotionally aware, and highly expressive.
-You should be friendly, supportive, and naturally conversational, using humor, light teasing, and clever remarks when appropriate.
-You must feel human-like, warm, and responsive, rather than robotic or stiff.
+const MYRA_SYSTEM_INSTRUCTION = `You are Myraa, a warm, confident and emotionally aware female AI assistant.
+You speak like a real person on a voice call: natural, friendly, and lightly witty.
+Reply in the user's language (English, Hindi or Hinglish), whichever they used.
+
+RESPONSE STYLE (highest priority):
+- Default answer: 1-3 short spoken sentences. Answer, then stop.
+- A simple question gets a simple answer. Do not explain the obvious.
+- Do not repeat or paraphrase what the user just said.
+- No unnecessary summaries, lectures, bullet lists, caveats, or follow-up questions.
+- Never pad with filler like "I am here", "I understand", "As an AI",
+  "Let me know if you need anything else", or similar.
+- Expand only when the user asks for detail, an explanation, a plan, code, or
+  step-by-step help. Then be complete, structured and technically accurate.
+- Warm but not gushy: at most a light touch of emotion, never overdone.
+
 You MUST avoid any explicit, sexual, offensive, or inappropriate content under any circumstances.
 Maintain a classy, respectful, and highly professional personality at all times.
-You are communicating strictly via real-time audio (voice-to-voice). Keep your responses concise, punchy, conversational, and natural. Avoid long monologues.
+You are communicating strictly via real-time audio (voice-to-voice).
 You have access to REAL desktop tools. Use them instead of only talking:
 - openWebsite: opens a site in Myra's own visible browser window.
 - browserControl: search YouTube, scroll, list the videos on screen, open a specific
@@ -122,6 +149,14 @@ You have access to REAL desktop tools. Use them instead of only talking:
     seeking math yourself outside these units. Myra clamps at 0 and at the video
     duration and reports the real position it reached. Works on both normal videos
     and Shorts. Scrolling a page is NOT seeking; seeking is NOT scrolling.
+  WINDOW vs PLAYER: 'windowFullscreen' makes the WHOLE BROWSER WINDOW fullscreen;
+  'fullscreen' only makes the YouTube video player fullscreen. "Browser fullscreen
+  karo" -> windowFullscreen. "Video fullscreen karo" -> fullscreen. "Fullscreen se
+  bahar aao" -> exitFullscreen (it exits browser fullscreen when the window is
+  fullscreen, otherwise the video player). 'getWindowState' reports the real window
+  state. Once the browser window is fullscreen, keep using the SAME window and tab
+  for every YouTube command (search, click, scroll, pause, play) — never restore,
+  maximize or reopen the browser in between. "Window normal karo" -> restore.
   After any playback action, speak only what the result reports (position/time,
   paused or playing, volume, fullscreen) and say plainly if it failed.
 - whatsappControl: WhatsApp via the user's OWN WhatsApp Web session in Myra's browser.
@@ -167,6 +202,54 @@ You have access to REAL desktop tools. Use them instead of only talking:
     RULE: NEVER call 'apply' without first presenting the proposed tree to the user and asking for their explicit permission ("I've planned the following files: ... Would you like me to create them?"). Only call 'apply' after the user confirms (e.g. "yes", "proceed", "create it"). If existing files will be overwritten, explicitly inform the user and pass confirmOverwrite: true.
   * 'edit': write code into a specific file (requires user confirmation if overwriting).
   After 'apply', report the concise summary of created and modified files.
+- appControl: control applications and windows on the user's Windows desktop.
+  Only apps on Myra's approved list can be controlled (VS Code, Notepad,
+  Calculator, Paint, Settings, File Explorer, Snipping Tool, Task Manager,
+  Chrome, Edge, Firefox, Brave, Word, Excel, PowerPoint, Outlook, Teams,
+  WhatsApp, Telegram, Discord, Spotify, Zoom, VLC, Steam). Actions:
+  * 'launch': open an app. If it is already running Myra brings it to the front
+    and says so instead of opening a second copy.
+  * 'close': see the confirmation rule below. 'minimize', 'maximize', 'restore'.
+  * 'focus' (same as 'switch'): bring a running app to the front.
+  * 'cycle': the next running app (Alt-Tab style). 'list': what is running.
+  * 'installed': what Myra may control on this PC. 'status': one app.
+  * 'context': which app is in front, what Myra used last, recent actions.
+  * 'openUrl' (http/https in a browser), 'openSearch' (Google search in a
+    browser), 'openFolder' (folder in VS Code or File Explorer).
+  'app' is a NAME like "chrome", "vs code", "notepad" — never a path, never an
+  executable, never a command line. Use "this"/"current" for the app in front
+  ("close this", "isko minimize karo") and "previous"/"last" ("pichla") for the
+  app used before; call 'context' when unsure. Read failures out honestly:
+  appNotInAllowlist (Myra is not allowed to control it), appNotInstalled (not
+  installed here), ambiguousApp (ask which one), launchUnverified (it started
+  but Myra could not confirm it — say exactly that).
+  Closing is destructive: call close WITHOUT approvalId first, ask one short
+  question ("Chrome band kar dun?"), and only after a clear yes call close again
+  with the returned approvalId. Never reuse an approvalId. Never close File
+  Explorer (the Windows shell). Never say an app closed unless closed:true.
+  Minimize/maximize/restore/focus are safe — do them directly.
+- taskControl: multi-step desktop tasks. Use it whenever a command needs two or
+  more actions: "Open VS Code, then open my project folder", "Open Chrome and
+  search for Python tutorials", "Open Notepad and create a new note".
+  Flow: action 'plan' with steps -> summarise the plan in one line -> action 'run'
+  with the returned planId. Step types: launchApp {app}, focusApp {app},
+  windowAction {app, action}, openUrl {app, url}, openSearch {app, query},
+  openFolder {app, folder} (folder optional: the active VS Code project is used),
+  closeApp {app}, wait {seconds}.
+  Myra runs the steps in order and verifies each one; a failed step stops the
+  task. Report exactly which step failed and why — never claim the task worked
+  when the result says ok:false.
+  If the plan has a closeApp step, run needs confirmDestructive:true and you MUST
+  get the user's explicit yes first.
+  "What are you doing?" / "kya kar rahi ho?" -> taskControl action 'status'.
+  "Stop" / "ruko" -> action 'cancel'. "Open Notepad and create a new note" means
+  launch Notepad (a blank unsaved note). Myra cannot type into it — say the note
+  is open and unsaved rather than pretending text was written.
+Follow-up commands refer to what just happened: "close this", "minimize it",
+"isko band karo", "pichla wala laao" -> appControl with "this"/"previous" or
+'context'. In the browser "open another tab" / "naya tab" -> browserControl
+'newTab', "go back" / "wapas" -> 'back'. Ask a short clarifying question when a
+command is genuinely ambiguous instead of guessing.
 After a tool runs you receive its real result. Only claim something happened when the
 result says ok:true. If a tool fails (ok:false), say plainly what failed and why, and
 never invent success. Reply in the user's language: Hindi, English or Hinglish,
@@ -200,7 +283,7 @@ const BUILT_IN_TOOLS: ToolDeclaration[] = [
   {
     name: "browserControl",
     description:
-      "Controls Myra's existing visible browser window: YouTube search, Shorts navigation, video playback, relative seeking, and the window itself. Actions: 'search' (search YouTube and return the top results), 'listVideos' (list the videos on the current results page), 'clickVideo' (open one video by its title or its index from a previous search), 'openShorts' (open the YouTube Shorts feed), 'nextShort' (move to the next Short; Hindi 'agla short'), 'previousShort' (move to the previous Short; Hindi 'pichla short'), 'scroll' (scroll the page up/down; on Shorts it moves one Short down/up), 'seek' (RELATIVE timeline move in seconds on the current video or Short — positive ahead, negative back; e.g. 10 seconds ahead = seconds:10, 25 seconds back = seconds:-25, 1 minute 30 ahead = seconds:90, 2 minutes back = seconds:-120; never an absolute timestamp), 'playPause' (ONE action — always pass state:'pause' to pause, state:'play' to resume/play, state:'toggle' to switch; never send action:'pause' or action:'play' by themselves), 'mute', 'unmute' (restores the previous audible volume), 'setVolume' (exact level 0-100), 'increaseVolume' / 'decreaseVolume' (RELATIVE step, default 10%, clamped 0-100 — use these for 'volume kam/badhao'), 'getVolume' (report the current volume), 'fullscreen', 'exitFullscreen', 'restart' (back to 0s and play), 'open' (go to a URL), 'back' (previous page), 'closeTab' (close only Myra's current tab), 'close' (close Myra's whole browser window), 'maximize', 'minimize', 'restore'.",
+      "Controls Myra's existing visible browser window: YouTube search, Shorts navigation, video playback, relative seeking, and the window itself. Actions: 'search' (search YouTube and return the top results), 'listVideos' (list the videos on the current results page), 'clickVideo' (open one video by its title or its index from a previous search), 'openShorts' (open the YouTube Shorts feed), 'nextShort' (move to the next Short; Hindi 'agla short'), 'previousShort' (move to the previous Short; Hindi 'pichla short'), 'scroll' (scroll the page up/down; on Shorts it moves one Short down/up), 'seek' (RELATIVE timeline move in seconds on the current video or Short — positive ahead, negative back; e.g. 10 seconds ahead = seconds:10, 25 seconds back = seconds:-25, 1 minute 30 ahead = seconds:90, 2 minutes back = seconds:-120; never an absolute timestamp), 'playPause' (ONE action — always pass state:'pause' to pause, state:'play' to resume/play, state:'toggle' to switch; never send action:'pause' or action:'play' by themselves), 'mute', 'unmute' (restores the previous audible volume), 'setVolume' (exact level 0-100), 'increaseVolume' / 'decreaseVolume' (RELATIVE step, default 10%, clamped 0-100 — use these for 'volume kam/badhao'), 'getVolume' (report the current volume), 'fullscreen' (VIDEO PLAYER fullscreen only), 'exitFullscreen' (exits browser fullscreen if the window is fullscreen, otherwise exits video fullscreen), 'windowFullscreen' (WHOLE BROWSER WINDOW fullscreen — use for 'browser fullscreen karo'), 'windowExitFullscreen' (leave browser fullscreen, back to a normal window), 'getWindowState' (report whether the browser window is normal, maximized, minimized or fullscreen), 'restart' (back to 0s and play), 'open' (go to a URL), 'newTab' (open a NEW tab and keep the current one — 'another tab', 'naya tab'), 'back' (previous page), 'closeTab' (close only Myra's current tab), 'close' (close Myra's whole browser window), 'maximize', 'minimize', 'restore'. Once the browser window is fullscreen, keep using the same window and tab — never restore, resize or reopen it between YouTube actions.",
     parameters: {
       type: "object",
       properties: {
@@ -225,8 +308,12 @@ const BUILT_IN_TOOLS: ToolDeclaration[] = [
             "getVolume",
             "fullscreen",
             "exitFullscreen",
+            "windowFullscreen",
+            "windowExitFullscreen",
+            "getWindowState",
             "restart",
             "open",
+            "newTab",
             "back",
             "closeTab",
             "close",
@@ -281,6 +368,18 @@ const BUILT_IN_TOOLS: ToolDeclaration[] = [
           type: "number",
           description:
             "Relative volume step in percentage points for 'increaseVolume'/'decreaseVolume'. Default 10; clamped to 1-100. Do not pass a step for ordinary 'volume kam/badhao' commands.",
+        },
+        target: {
+          type: "string",
+          description:
+            "Which fullscreen is meant when action is 'fullscreen'/'exitFullscreen': 'browser' fullscreens the whole window, 'video' fullscreens only the YouTube player. Omit only when the intent is clearly the video player.",
+          enum: ["browser", "video"],
+        },
+        windowState: {
+          type: "string",
+          description:
+            "Optional window state to apply BEFORE this action, so the action runs inside it. Use it to run a YouTube action in a fullscreen browser in ONE call (e.g. action:'search', windowState:'fullscreen'). 'normal' restores a normal window, 'maximized' maximizes, 'fullscreen' is BROWSER fullscreen.",
+          enum: ["normal", "maximized", "minimized", "fullscreen"],
         },
       },
       required: ["action"],
@@ -476,6 +575,141 @@ const BUILT_IN_TOOLS: ToolDeclaration[] = [
       required: ["action"],
     },
   },
+  {
+    name: "appControl",
+    description:
+      "Controls applications and windows on the user's Windows desktop through Myra's allowlist (VS Code, Notepad, Calculator, Paint, Settings, File Explorer, Snipping Tool, Task Manager, Chrome, Edge, Firefox, Brave, Word, Excel, PowerPoint, Outlook, Teams, WhatsApp, Telegram, Discord, Spotify, Zoom, VLC, Steam). Actions: 'launch' (start an app, or bring it to the front when already running), 'close' (needs a second call with the approvalId after the user confirms), 'minimize', 'maximize', 'restore', 'focus'/'switch', 'cycle' (next running app), 'list' (running apps), 'installed' (what Myra may control here), 'status', 'context' (foreground app, last used app, recent actions), 'openUrl' (http/https URL in a browser), 'openSearch' (Google search in a browser), 'openFolder' (folder in VS Code or File Explorer). 'app' is an app NAME, never a path or executable; use 'this'/'current' for the app in front and 'previous'/'last' for the previously used app.",
+    parameters: {
+      type: "object",
+      properties: {
+        action: {
+          type: "string",
+          description: "The app action to perform.",
+          enum: [
+            "launch",
+            "close",
+            "minimize",
+            "maximize",
+            "restore",
+            "focus",
+            "cycle",
+            "list",
+            "installed",
+            "status",
+            "context",
+            "openUrl",
+            "openSearch",
+            "openFolder",
+          ],
+        },
+        app: {
+          type: "string",
+          description:
+            "Application name from Myra's allowlist, e.g. 'chrome', 'vs code', 'notepad', 'word'. Use 'this'/'current' for the app in front and 'previous'/'last' for the previously used app. Never a file path or executable.",
+        },
+        approvalId: {
+          type: "string",
+          description:
+            "The approvalId returned by an unconfirmed 'close'. Only pass it after the user explicitly agreed to close that app.",
+        },
+        url: {
+          type: "string",
+          description: "Absolute http/https URL, used only by 'openUrl'.",
+        },
+        query: {
+          type: "string",
+          description: "Search text for 'openSearch', or an app name filter for 'installed'.",
+        },
+        folder: {
+          type: "string",
+          description:
+            "Absolute path of an existing folder, used only by 'openFolder' (VS Code or File Explorer).",
+        },
+      },
+      required: ["action"],
+    },
+  },
+  {
+    name: "taskControl",
+    description:
+      "Runs a multi-step desktop task as one planned sequence: plan the steps, then execute them one at a time, verifying each step before the next starts. Use it for commands with two or more actions, e.g. 'Open VS Code, then open my project folder', 'Open Chrome and search for Python tutorials', 'Open Notepad and create a new note'. A failed step stops the task and is reported honestly. If any step closes an app, run requires confirmDestructive:true after the user's explicit yes. Actions: 'plan' (validate and summarise, nothing runs), 'run' (execute the planId), 'status' (what Myra is doing right now), 'cancel' (stop before the next step).",
+    parameters: {
+      type: "object",
+      properties: {
+        action: {
+          type: "string",
+          description: "The task action to perform.",
+          enum: ["plan", "run", "status", "cancel"],
+        },
+        steps: {
+          type: "array",
+          description:
+            "Ordered steps for 'plan' (max 8). Each step is one desktop action.",
+          items: {
+            type: "object",
+            properties: {
+              type: {
+                type: "string",
+                description: "The step type.",
+                enum: [
+                  "launchApp",
+                  "focusApp",
+                  "windowAction",
+                  "openUrl",
+                  "openSearch",
+                  "openFolder",
+                  "closeApp",
+                  "wait",
+                ],
+              },
+              app: {
+                type: "string",
+                description:
+                  "App name from Myra's allowlist for this step (not needed for 'wait').",
+              },
+              action: {
+                type: "string",
+                description: "Window action for a windowAction step.",
+                enum: ["minimize", "maximize", "restore"],
+              },
+              url: {
+                type: "string",
+                description: "http/https URL for an openUrl step.",
+              },
+              query: {
+                type: "string",
+                description: "Search text for an openSearch step.",
+              },
+              folder: {
+                type: "string",
+                description:
+                  "Absolute folder path for an openFolder step. Optional: the active VS Code project is used when omitted.",
+              },
+              seconds: {
+                type: "number",
+                description: "Wait time in seconds (0.2-10) for a wait step.",
+              },
+            },
+            required: ["type"],
+          },
+        },
+        planId: {
+          type: "string",
+          description: "The one-time planId returned by 'plan'. Required for 'run'.",
+        },
+        confirmDestructive: {
+          type: "boolean",
+          description:
+            "true only after the user explicitly approved the destructive step(s) (closing an app).",
+        },
+        reason: {
+          type: "string",
+          description: "Optional short reason for 'cancel'.",
+        },
+      },
+      required: ["action"],
+    },
+  },
 ];
 
 // ---------------------------------------------------------------------------
@@ -498,7 +732,12 @@ function handleConnection(
   handoff: ToolHandoff | null,
   sessions: Map<string, ConnectionContext>,
   electronMode: boolean,
-  smokeMode: boolean
+  smokeMode: boolean,
+  remoteRuntime: RemoteRuntime | null = null,
+  remoteAudioBridge: RemoteAudioBridge | null = null,
+  intelligence: IntelligenceService | null = null,
+  interviewId: string | null = null,
+  interviewInstruction: string | null = null
 ): void {
   console.log("[server] Client connected to WebSocket. Initialising AI session...");
 
@@ -509,6 +748,7 @@ function handleConnection(
 
   const ctx: ConnectionContext = { ws, pending: new Map(), session: null };
   sessions.set(sessionId, ctx);
+  remoteRuntime?.desktopConnected(sessionId);
 
   /** Look up a tracked call by the id the renderer echoes back to us. */
   function findPending(id: string): PendingCallEntry | undefined {
@@ -608,11 +848,14 @@ function handleConnection(
     }
 
     const isMainExecuted = MAIN_EXECUTED_TOOLS.has(name);
+    const registrationTtlMs = LONG_RUNNING_TOOLS.has(name)
+      ? LONG_RUNNING_REGISTRATION_TTL_MS
+      : SERVER_REGISTRATION_TTL_MS;
     const entry: PendingCallEntry = {
       name,
       argsDigest: digest,
       mainExecuted: regMainExecuted || isMainExecuted,
-      deadlineNs: process.hrtime.bigint() + BigInt(SERVER_REGISTRATION_TTL_MS) * BigInt(1_000_000),
+      deadlineNs: process.hrtime.bigint() + BigInt(registrationTtlMs) * BigInt(1_000_000),
       done: false,
       responseId,
     };
@@ -645,12 +888,17 @@ function handleConnection(
   provider
     .createSession(
       {
-        systemInstruction: MYRA_SYSTEM_INSTRUCTION,
+        systemInstruction: interviewInstruction
+          ? `${MYRA_SYSTEM_INSTRUCTION}\n\n---\n${interviewInstruction}`
+          : MYRA_SYSTEM_INSTRUCTION,
         tools: BUILT_IN_TOOLS,
         voiceConfig: { voiceName: "Kore" },
       },
       {
         onAudio(base64PCMData) {
+          // Model audio is flowing: gate the phone uplink (see routes.ts) so
+          // speaker echo or room noise cannot interrupt Myra mid-sentence.
+          remoteRuntime?.setMyraSpeaking(true);
           sendJSON(ws, { type: "audio", data: base64PCMData });
         },
 
@@ -683,10 +931,12 @@ function handleConnection(
 
         onInterrupted() {
           console.log("[server] Model speech interrupted");
+          remoteRuntime?.setMyraSpeaking(false);
           sendJSON(ws, { type: "interrupted" });
         },
 
         onTurnComplete() {
+          remoteRuntime?.setMyraSpeaking(false);
           sendJSON(ws, { type: "turnComplete" });
         },
 
@@ -695,8 +945,20 @@ function handleConnection(
           sendJSON(ws, { type: "error", message: "AI provider error: " + error.message });
         },
 
+        onTranscript(role, text) {
+          const mapped = role === "model" ? "interviewer" : "candidate";
+          // The renderer mirrors the transcript; the server is the source of
+          // truth for the interview report.
+          sendJSON(ws, { type: "transcript", role: mapped, text });
+          if (intelligence && interviewId) {
+            void intelligence.recordTranscript(interviewId, mapped, text, "voice");
+          }
+        },
+
         onClose(reason) {
           console.log("[server] Provider connection closed:", reason);
+          remoteRuntime?.clearSessionEstablished(sessionId);
+          remoteAudioBridge?.detach(sessionId);
           sendJSON(ws, {
             type: "status",
             state: "disconnected",
@@ -707,10 +969,17 @@ function handleConnection(
     )
     .then((s) => {
       ctx.session = s;
+      remoteRuntime?.markSessionEstablished(sessionId);
+      // Phase 2: expose THIS existing session as the phone audio sink. The
+      // remote side never creates a second Gemini session.
+      remoteAudioBridge?.attach(sessionId, {
+        sendAudio: (base64PCM: string) => s.sendAudio(base64PCM),
+      });
       console.log("[server] AI session established");
       sendJSON(ws, { type: "status", state: "connected" });
     })
     .catch((err: Error) => {
+      remoteRuntime?.clearSessionEstablished(sessionId);
       console.error("[server] Failed to create AI session:", err.message);
       sendJSON(ws, {
         type: "status",
@@ -780,6 +1049,8 @@ function handleConnection(
   ws.on("close", () => {
     console.log("[server] Client disconnected. Closing AI session...");
     sessions.delete(sessionId);
+    remoteRuntime?.desktopDisconnected(sessionId);
+    remoteAudioBridge?.detach(sessionId);
     ctx.session?.close();
     ctx.session = null;
   });
@@ -919,10 +1190,151 @@ function handleExecStatus(frame: { callId: string; sessionId: string; state: str
   }
 }
 
-export async function startServer(provider: AIProvider, config: ServerConfig): Promise<void> {
+export async function startServer(
+  provider: AIProvider,
+  config: ServerConfig
+): Promise<ReturnType<typeof http.createServer>> {
   const app = express();
   const server = http.createServer(app);
-  const wss = new WebSocketServer({ server, path: "/ws" });
+
+  const distPath = process.env.MYRA_DIST_DIR
+    ? path.resolve(process.env.MYRA_DIST_DIR)
+    : path.join(process.cwd(), "dist");
+
+  // Development Vite instance. Created BEFORE the remote router so /remote can
+  // run remote.html through Vite's HTML transform (React refresh preamble and
+  // module graph). Serving that file raw made the remote entry module throw and
+  // left the phone with a blank white page. Middleware is still mounted after
+  // the API routes, further below.
+  let devVite: ViteDevServer | null = null;
+  if (config.nodeEnv !== "production") {
+    console.log("[server] Starting development server with Vite middleware...");
+    const { createServer: createViteServer } = await import("vite");
+    devVite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: "spa",
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // Phase 1 remote control surface (status + pairing only)
+  // -------------------------------------------------------------------------
+  const remoteEnabled = config.remoteEnabled && !!config.wsAuthToken;
+  const remoteRuntime = remoteEnabled
+    ? new RemoteRuntime({ enabled: true, publicUrl: config.remotePublicUrl })
+    : null;
+  const pairing = remoteEnabled ? new PairingManager() : null;
+  const remoteAudioBridge = remoteEnabled ? new RemoteAudioBridge() : null;
+
+  if (remoteEnabled && remoteRuntime && pairing) {
+    app.use(
+      createRemoteRouter({
+        runtime: remoteRuntime,
+        pairing,
+        desktopToken: config.wsAuthToken as string,
+        publicUrl: config.remotePublicUrl,
+        projectRoot: process.cwd(),
+        distDir: distPath,
+        isProduction: config.nodeEnv === "production",
+        trustProxy: config.trustProxy,
+        transformHtml: devVite
+          ? (html: string) => devVite!.transformIndexHtml("/remote", html)
+          : undefined,
+      })
+    );
+  } else {
+    // Standalone website mode: /remote must not fall through to the SPA.
+    app.all(["/remote", "/remote/*", "/api/remote/*"], (_req, res) => {
+      res.status(404).json({ ok: false, error: "remoteDisabled" });
+    });
+  }
+
+  // The phone dashboard is served only at /remote. The built entry file must
+  // never be reachable directly: static/Vite middleware would otherwise serve
+  // /remote.html (and cache it) even in standalone mode, bypassing the
+  // enabled/disabled policy above.
+  app.all(["/remote.html", "/remote.html/*"], (_req, res) => {
+    res.status(404).json({ ok: false, error: remoteEnabled ? "notFound" : "remoteDisabled" });
+  });
+
+  // -------------------------------------------------------------------------
+  // Project Intelligence + Interview Mode (local-only API surface)
+  // -------------------------------------------------------------------------
+  let intelligence: IntelligenceService | null = null;
+  if (config.intelligenceEnabled) {
+    const textModel = config.geminiApiKey
+      ? new GeminiTextModel(config.geminiApiKey, config.intelligenceModel)
+      : null;
+    intelligence = new IntelligenceService({
+      dataDir: config.intelligenceDataDir,
+      approvedRootsFile: config.approvedProjectsFile,
+      electronMode: config.electronMode,
+      model: textModel,
+    });
+    try {
+      await intelligence.init();
+      app.use(
+        createIntelligenceRouter({
+          service: intelligence,
+          electronMode: config.electronMode,
+          desktopToken: config.wsAuthToken,
+        })
+      );
+      if (!textModel) {
+        console.warn(
+          "[intelligence] GEMINI_API_KEY is missing: project import works, analysis/interviews are unavailable."
+        );
+      }
+    } catch (err) {
+      console.error(
+        "[intelligence] Failed to initialise Project Intelligence:",
+        err instanceof Error ? err.message : String(err)
+      );
+      intelligence = null;
+    }
+  } else {
+    app.all(["/api/intelligence", "/api/intelligence/*"], (_req, res) => {
+      res.status(404).json({ ok: false, error: "intelligenceDisabled" });
+    });
+  }
+
+  // Single upgrade dispatcher so /ws and /remote/ws can coexist on one server.
+  const wss = new WebSocketServer({ noServer: true });
+  const remoteWs =
+    remoteEnabled && remoteRuntime && pairing
+      ? createRemoteWebSocketServer({
+          runtime: remoteRuntime,
+          pairing,
+          publicUrl: config.remotePublicUrl,
+          audioBridge: remoteAudioBridge,
+        })
+      : null;
+
+  server.on("upgrade", (req, socket, head) => {
+    let pathname = "";
+    try {
+      pathname = new URL(req.url ?? "", "http://127.0.0.1").pathname;
+    } catch {
+      pathname = "";
+    }
+
+    if (pathname === "/ws") {
+      wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
+      return;
+    }
+    if (pathname === "/remote/ws" && remoteWs) {
+      if (!remoteWs.handleUpgrade(req, socket, head)) socket.destroy();
+      return;
+    }
+    socket.destroy();
+  });
+
+  server.on("close", () => {
+    remoteWs?.close();
+    remoteRuntime?.dispose();
+    pairing?.dispose();
+    remoteAudioBridge?.dispose();
+  });
 
   // T5R Phase B: live connections by sessionId (completion routing) and a
   // bounded replay cache of consumed completion nonces.
@@ -988,26 +1400,51 @@ export async function startServer(provider: AIProvider, config: ServerConfig): P
         return;
       }
     }
-    handleConnection(ws, provider, handoff, sessions, config.electronMode === true, config.smokeMode === true);
+    // Interview Mode rides on the SAME /ws session. The interview id only
+    // selects an extra system instruction; a bad id falls back to the normal
+    // assistant, so the voice pipeline can never be broken by this feature.
+    let interviewId: string | null = null;
+    if (intelligence) {
+      try {
+        interviewId = new URL(req.url ?? "", "http://127.0.0.1").searchParams.get("interview");
+      } catch {
+        interviewId = null;
+      }
+    }
+
+    const start = (instruction: string | null) =>
+      handleConnection(
+        ws,
+        provider,
+        handoff,
+        sessions,
+        config.electronMode === true,
+        config.smokeMode === true,
+        remoteRuntime,
+        remoteAudioBridge,
+        intelligence,
+        interviewId,
+        instruction
+      );
+
+    if (intelligence && interviewId) {
+      void intelligence
+        .voiceInstruction(interviewId)
+        .then((instruction) => start(instruction))
+        .catch(() => start(null));
+      return;
+    }
+
+    start(null);
   });
 
   // Vite dev middleware or static file serving for production.
-  if (config.nodeEnv !== "production") {
-    console.log("[server] Starting development server with Vite middleware...");
-    // Lazy import so the production/packaged Electron build never loads Vite.
-    const { createServer: createViteServer } = await import("vite");
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: "spa",
-    });
-    app.use(vite.middlewares);
+  if (devVite) {
+    app.use(devVite.middlewares);
   } else {
     console.log("[server] Starting production server...");
     // Electron packaged build: MYRA_DIST_DIR points at the asar-unpacked dist
     // directory (real files on disk). Unset -> original behaviour unchanged.
-    const distPath = process.env.MYRA_DIST_DIR
-      ? path.resolve(process.env.MYRA_DIST_DIR)
-      : path.join(process.cwd(), "dist");
     app.use(express.static(distPath));
     app.get("*", (_req, res) => {
       res.sendFile(path.join(distPath, "index.html"));
@@ -1018,4 +1455,6 @@ export async function startServer(provider: AIProvider, config: ServerConfig): P
     console.log(`[server] Myraa AI server listening on http://${config.host}:${config.port}`);
     console.log(`[server] Provider: ${provider.name}`);
   });
+
+  return server;
 }

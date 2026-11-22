@@ -14,9 +14,14 @@ import {
   AlertCircle,
   Clock,
   Globe,
+  Smartphone,
+  RefreshCw,
+  AppWindow,
+  GraduationCap,
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import MyraaWaveform from "./components/MyraaWaveform";
+import InterviewMode from "./components/InterviewMode";
 import { AudioPlayer } from "./utils/audioPlayer";
 import { AudioStreamer } from "./utils/audioStreamer";
 import { AssistantState, ServerMessage } from "./types";
@@ -57,6 +62,36 @@ interface ProjectBuilderState {
   };
 }
 
+interface DesktopTaskStep {
+  index: number;
+  type: string;
+  summary: string;
+  state: "pending" | "running" | "done" | "failed" | "skipped";
+  detail?: string | null;
+  error?: string | null;
+  attempts?: number;
+}
+
+interface DesktopTaskState {
+  state: "idle" | "running" | "completed" | "failed" | "cancelled";
+  taskId: string | null;
+  steps: DesktopTaskStep[];
+  currentIndex: number;
+  completedCount: number;
+  failedCount: number;
+  total?: number;
+  detail?: string | null;
+  error?: string | null;
+}
+
+interface RemotePairingInfo {
+  code: string;
+  expiresAt: number;
+  pairedDevice: string | null;
+  pairedAt: number | null;
+  remoteUrl: string | null;
+}
+
 const PERSONALITY_QUOTES = [
   "Oh, I'm already ahead of you. Just say the word and I'll have that flight booked before you can finish your coffee.",
   "Charming you with wit and executing real-world actions in milliseconds. What can we solve together next?",
@@ -71,6 +106,13 @@ const formatDuration = (seconds: number) => {
   return `${mins.toString().padStart(2, "0")}:${secs.toString().padStart(2, "0")}`;
 };
 
+const formatCountdown = (ms: number) => {
+  const total = Math.max(0, Math.ceil(ms / 1000));
+  const mins = Math.floor(total / 60);
+  const secs = total % 60;
+  return `${mins}:${secs.toString().padStart(2, "0")}`;
+};
+
 /**
  * Human-readable one-liner for the action register. Myra speaks the real
  * result through the model; this is only the UI mirror of it.
@@ -78,7 +120,10 @@ const formatDuration = (seconds: number) => {
 function describeToolResult(name: string, args: any, output: any, failed: boolean): string {
   if (failed) return `${name} failed: ${output?.error ?? "unknown error"}`;
   if (output?.accepted) return `${name}: running in desktop`;
-  if (output?.ok === false) return `${name}: ${output?.error ?? "failed"}`;
+  if (output?.ok === false) {
+    const detail = typeof output?.detail === "string" ? output.detail : null;
+    return `${name}: ${output?.error ?? "failed"}${detail ? ` — ${detail}` : ""}`;
+  }
 
   switch (name) {
     case "getSystemTime":
@@ -142,8 +187,29 @@ function describeToolResult(name: string, args: any, output: any, failed: boolea
       if (action === "unmute") {
         return `Audio on${output?.restoredVolume != null ? ` at ${output.restoredVolume}%` : ""}`;
       }
+      if (action === "windowFullscreen" || action === "windowExitFullscreen") {
+        if (output?.ok === false) return `Browser window: ${output?.error ?? "failed"}`;
+        return output?.windowState === "fullscreen"
+          ? "Browser fullscreen"
+          : `Browser window: ${output?.windowState ?? "normal"}`;
+      }
+      if (action === "getWindowState") {
+        return output?.ok
+          ? `Browser window: ${output?.windowState ?? "unknown"}`
+          : `Browser window: ${output?.error ?? "unavailable"}`;
+      }
       if (action === "fullscreen" || action === "exitFullscreen") {
-        return output?.fullscreen ? "Fullscreen" : "Windowed";
+        if (output?.target === "browser" || output?.mode === "browser") {
+          return output?.ok
+            ? `Browser ${output?.windowState === "fullscreen" ? "fullscreen" : "windowed"}`
+            : `Browser fullscreen failed: ${output?.error ?? "unknown"}`;
+        }
+        return output?.fullscreen ? "Video fullscreen" : "Video windowed";
+      }
+      if (action === "maximize" || action === "minimize" || action === "restore") {
+        return output?.ok
+          ? `Window ${output?.windowState ?? action}`
+          : `Window ${action} failed: ${output?.error ?? "unknown"}`;
       }
       if (action === "restart") return `Restarted from 0:00`;
       if (action === "scroll") {
@@ -185,6 +251,42 @@ function describeToolResult(name: string, args: any, output: any, failed: boolea
       }
       return `File: ${action || "action"}`;
     }
+    case "appControl": {
+      const action = String(output?.action ?? args?.action ?? "");
+      const title = output?.app?.title ?? args?.app ?? "app";
+      if (action === "launch") {
+        return output?.alreadyRunning
+          ? `${title} already running — brought to front`
+          : `${title} launched`;
+      }
+      if (action === "close") return output?.closed ? `${title} closed` : `${title} not closed`;
+      if (action === "focus" || action === "switch") return `${title} in front`;
+      if (action === "cycle") return `Switched to ${title}`;
+      if (action === "minimize" || action === "maximize" || action === "restore") {
+        return `${title} — ${action}`;
+      }
+      if (action === "list") return `${output?.count ?? 0} app(s) running`;
+      if (action === "installed") return `${output?.installedCount ?? 0} app(s) available`;
+      if (action === "status") return `${title}: ${output?.running ? "running" : "not running"}`;
+      if (action === "context") {
+        return output?.activeApp ? `In front: ${output.activeApp.title}` : "Foreground app not manageable";
+      }
+      if (action === "openFolder") return `${title}: opened ${output?.folderName ?? "folder"}`;
+      if (action === "openSearch") return `${title}: searched "${output?.query ?? ""}"`;
+      if (action === "openUrl") return `${title}: opened ${output?.url ?? ""}`;
+      return `App: ${action}`;
+    }
+    case "taskControl": {
+      const action = String(args?.action ?? "");
+      if (Array.isArray(output?.steps)) {
+        const steps = output.steps as DesktopTaskStep[];
+        const done = steps.filter((step) => step.state === "done").length;
+        return `Task ${output?.state ?? "?"}: ${done}/${steps.length} step(s)`;
+      }
+      if (action === "plan") return `Task plan: ${output?.stepCount ?? 0} step(s)`;
+      if (action === "cancel") return output?.cancelled ? "Task cancelled" : "Nothing to cancel";
+      return `Task: ${action}`;
+    }
     default:
       return `${name} done`;
   }
@@ -197,9 +299,28 @@ export default function App() {
   const [executedTools, setExecutedTools] = useState<ExecutedTool[]>([]);
   const [projectState, setProjectState] = useState<ProjectBuilderState>({});
   const [fileState, setFileState] = useState<any>(null);
+  const [taskState, setTaskState] = useState<DesktopTaskState | null>(null);
   const [latency, setLatency] = useState<number | null>(null);
   const [sessionSeconds, setSessionSeconds] = useState<number>(0);
   const [quoteIndex, setQuoteIndex] = useState<number>(0);
+
+  // Phase 1 remote control (Electron mode only). The desktop never activates
+  // Myra directly when the phone remote is present; it shows pairing info.
+  const desktopBridge = (window as any).myraDesktop;
+  const electronMode =
+    typeof desktopBridge?.wsAuthToken === "string" && desktopBridge.wsAuthToken.length > 0;
+  const [remotePairing, setRemotePairing] = useState<RemotePairingInfo | null>(null);
+  const [remotePairingError, setRemotePairingError] = useState<string | null>(null);
+  const [remotePanelOpen, setRemotePanelOpen] = useState<boolean>(electronMode);
+  const [remoteNow, setRemoteNow] = useState<number>(Date.now());
+
+  // Project Intelligence / Interview Mode panel. Voice interviews reuse the
+  // EXISTING session; only the interview id and transcript mirror are new.
+  const [interviewOpen, setInterviewOpen] = useState<boolean>(false);
+  const [voiceInterviewId, setVoiceInterviewId] = useState<string | null>(null);
+  const [voiceTranscript, setVoiceTranscript] = useState<
+    { role: "interviewer" | "candidate"; text: string }[]
+  >([]);
 
   // References to handle stale closures and capture resources
   const stateRef = useRef<AssistantState>("disconnected");
@@ -286,6 +407,55 @@ export default function App() {
     };
   }, []);
 
+  // Phase 1: fetch the pairing code / phone URL from the local server while in
+  // Electron mode. Authenticated with the per-run desktop token, which never
+  // reaches the phone.
+  useEffect(() => {
+    if (!electronMode) return;
+    const token = (window as any).myraDesktop?.wsAuthToken;
+    if (typeof token !== "string" || !token) return;
+
+    let alive = true;
+    const load = async () => {
+      try {
+        const res = await fetch("/api/remote/pairing", {
+          headers: { "x-myra-desktop-token": token },
+          cache: "no-store",
+        });
+        if (!alive) return;
+        if (!res.ok) {
+          setRemotePairingError(
+            res.status === 401
+              ? "Desktop authentication failed."
+              : "Remote control is unavailable."
+          );
+          return;
+        }
+        const data = await res.json();
+        if (!alive) return;
+        setRemotePairing({
+          code: String(data.code ?? ""),
+          expiresAt: Number(data.expiresAt) || 0,
+          pairedDevice: typeof data.pairedDevice === "string" ? data.pairedDevice : null,
+          pairedAt: typeof data.pairedAt === "number" ? data.pairedAt : null,
+          remoteUrl: typeof data.remoteUrl === "string" ? data.remoteUrl : null,
+        });
+        setRemotePairingError(null);
+      } catch {
+        if (alive) setRemotePairingError("Cannot reach the local Myra server.");
+      }
+    };
+
+    void load();
+    const poll = window.setInterval(load, 5_000);
+    const tick = window.setInterval(() => setRemoteNow(Date.now()), 1_000);
+    return () => {
+      alive = false;
+      window.clearInterval(poll);
+      window.clearInterval(tick);
+    };
+  }, [electronMode]);
+
   // Desktop file bridge: reflect the file currently open for this conversation.
   // The preload API returns metadata only — never file contents.
   useEffect(() => {
@@ -296,6 +466,22 @@ export default function App() {
       if (alive && s) setFileState(s);
     }).catch(() => {});
     const unsubscribe = api.onState?.((s: any) => setFileState(s));
+    return () => {
+      alive = false;
+      if (typeof unsubscribe === "function") unsubscribe();
+    };
+  }, []);
+
+  // Phase 3: live mirror of the main-process task runner (read-only). Starting
+  // or cancelling a task always goes through the authenticated tool path.
+  useEffect(() => {
+    const api = (window as any).myraDesktop?.taskStatus;
+    if (!api) return;
+    let alive = true;
+    api.get?.().then((s: any) => {
+      if (alive && s) setTaskState(s);
+    }).catch(() => {});
+    const unsubscribe = api.onState?.((s: any) => setTaskState(s));
     return () => {
       alive = false;
       if (typeof unsubscribe === "function") unsubscribe();
@@ -407,7 +593,7 @@ export default function App() {
     }
   };
 
-  const connectSession = async () => {
+  const connectSession = async (interviewId?: string) => {
     setError(null);
     setState("connecting");
 
@@ -427,9 +613,16 @@ export default function App() {
       const desktop = (window as any).myraDesktop;
       const authToken = typeof desktop?.wsAuthToken === "string" ? desktop.wsAuthToken : null;
       const authSuffix = authToken ? `?auth=${encodeURIComponent(authToken)}` : "";
-      const wsUrl = `${protocol}//${window.location.host}/ws${authSuffix}`;
+      // Interview Mode is an extra query parameter on the same /ws session.
+      const interviewSuffix = interviewId ? `&interview=${encodeURIComponent(interviewId)}` : "";
+      const wsUrl = `${protocol}//${window.location.host}/ws${authSuffix}${interviewSuffix}`;
 
-      console.log("Connecting to voice-to-voice server at:", wsUrl);
+      // Never log the authenticated URL: in Electron mode it carries the
+      // per-run desktop token in the query string.
+      const authLabel = authToken ? " (authenticated)" : "";
+      console.log(
+        `Connecting to voice-to-voice server at: ${protocol}//${window.location.host}/ws${authLabel}`
+      );
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
 
@@ -584,6 +777,16 @@ export default function App() {
             }
           }
 
+          // Interview Mode: speech transcription from the existing Gemini
+          // Live session. Purely additive; normal voice runs never emit it.
+          else if ((msg as any).type === "transcript") {
+            const role = (msg as any).role === "interviewer" ? "interviewer" : "candidate";
+            const text = String((msg as any).text ?? "");
+            if (text) {
+              setVoiceTranscript((prev) => [...prev.slice(-40), { role, text }]);
+            }
+          }
+
           // Handle authenticated completions from main process
           else if ((msg as any).type === "toolCompletion") {
             const { callId, name, status, output } = msg as any;
@@ -634,11 +837,56 @@ export default function App() {
     }
   };
 
+  const startInterviewVoice = (interviewId: string) => {
+    setVoiceTranscript([]);
+    setVoiceInterviewId(interviewId);
+    if (stateRef.current !== "disconnected") {
+      disconnectSession();
+      // Give the previous socket a tick to close before opening the new one.
+      window.setTimeout(() => void connectSession(interviewId), 80);
+      return;
+    }
+    void connectSession(interviewId);
+  };
+
+  const stopInterviewVoice = () => {
+    setVoiceInterviewId(null);
+    disconnectSession();
+  };
+
   const handleToggle = () => {
+    // PC voice and phone remote are independent entry points to the SAME
+    // backend session. The desktop toggle always controls the local PC voice
+    // session (Electron and website runs alike); the phone panel has its own
+    // button and never hijacks this control.
     if (state !== "disconnected") {
       disconnectSession();
     } else {
       connectSession();
+    }
+  };
+
+  const rotatePairingCode = async () => {
+    const token = (window as any).myraDesktop?.wsAuthToken;
+    if (typeof token !== "string" || !token) return;
+    try {
+      const res = await fetch("/api/remote/pairing/rotate", {
+        method: "POST",
+        headers: { "x-myra-desktop-token": token },
+      });
+      if (!res.ok) throw new Error(`rotate failed (${res.status})`);
+      const data = await res.json();
+      setRemotePairing({
+        code: String(data.code ?? ""),
+        expiresAt: Number(data.expiresAt) || 0,
+        pairedDevice: typeof data.pairedDevice === "string" ? data.pairedDevice : null,
+        pairedAt: typeof data.pairedAt === "number" ? data.pairedAt : null,
+        remoteUrl: typeof data.remoteUrl === "string" ? data.remoteUrl : null,
+      });
+      setRemotePairingError(null);
+      setRemoteNow(Date.now());
+    } catch {
+      setRemotePairingError("Could not generate a new code.");
     }
   };
 
@@ -727,8 +975,182 @@ export default function App() {
         </div>
       </main>
 
+      {/* Phase 1 remote pairing / phone status (Electron mode only) */}
+      {electronMode && remotePanelOpen && (
+        <motion.section
+          initial={{ opacity: 0, y: 12 }}
+          animate={{ opacity: 1, y: 0 }}
+          exit={{ opacity: 0, y: 12 }}
+          className="relative w-full max-w-lg mx-auto z-20 mb-4"
+          id="remote-pairing-panel"
+        >
+          <div className="glass-panel rounded-2xl p-4 border border-cyan-500/20 bg-slate-900/85 shadow-xl flex flex-col gap-3">
+            <div className="flex items-center justify-between gap-3">
+              <div className="flex items-center gap-2.5 min-w-0">
+                <div className="w-8 h-8 rounded-xl border border-cyan-500/30 bg-cyan-500/10 flex items-center justify-center shrink-0">
+                  <Smartphone className="w-4 h-4 text-cyan-300" />
+                </div>
+                <div className="min-w-0">
+                  <p className="font-mono text-[9px] uppercase tracking-[0.2em] text-slate-400">
+                    Phone Remote
+                  </p>
+                  <p className="text-xs font-medium text-slate-100 truncate">
+                    {remotePairing?.pairedDevice
+                      ? `Paired: ${remotePairing.pairedDevice}`
+                      : "Waiting for a phone"}
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={rotatePairingCode}
+                className="shrink-0 flex items-center gap-1.5 text-[9px] font-mono uppercase tracking-wider text-cyan-300 border border-cyan-500/40 bg-cyan-950/40 px-2.5 py-1.5 rounded-lg hover:bg-cyan-900/40 transition-colors"
+                title="Generate a new one-time pairing code"
+                id="remote-rotate-code-btn"
+              >
+                <RefreshCw className="w-3 h-3" />
+                New code
+              </button>
+            </div>
+
+            <div className="rounded-xl border border-white/10 bg-slate-950/70 px-3 py-3 text-center">
+              <p className="font-mono text-[8px] uppercase tracking-[0.2em] text-slate-500">
+                One-time pairing code
+              </p>
+              <p className="mt-1 font-mono text-2xl tracking-[0.35em] text-cyan-200 select-all">
+                {remotePairing?.code
+                  ? remotePairing.code.replace(/^(\d{3})(\d{3})$/, "$1 $2")
+                  : "——— ———"}
+              </p>
+              <p className="mt-1 font-mono text-[9px] text-slate-500">
+                {remotePairing?.expiresAt
+                  ? `expires in ${formatCountdown(remotePairing.expiresAt - remoteNow)}`
+                  : "—"}
+              </p>
+            </div>
+
+            <div className="rounded-xl border border-white/5 bg-slate-950/50 px-3 py-2">
+              <p className="font-mono text-[8px] uppercase tracking-[0.2em] text-slate-500">
+                Open on your phone
+              </p>
+              <p className="mt-1 text-[11px] font-mono text-cyan-200 break-all select-all">
+                {remotePairing?.remoteUrl ||
+                  "Set MYRA_REMOTE_PUBLIC_URL (see docs/REMOTE_CONTROL.md)"}
+              </p>
+            </div>
+
+            {remotePairingError && (
+              <p className="text-[10px] text-red-300 bg-red-950/40 border border-red-500/30 rounded-lg px-2 py-1.5 flex items-center gap-1.5">
+                <AlertCircle className="w-3 h-3 shrink-0" />
+                {remotePairingError}
+              </p>
+            )}
+
+            <p className="text-[9px] leading-relaxed text-slate-500">
+              PC voice and the phone microphone both feed the same Myra session. Start voice here on
+              the PC, then pair your phone to stream its microphone through Tailscale. If you start
+              voice only from the phone, keep the PC app running — the phone never opens a second
+              Gemini session.
+            </p>
+          </div>
+        </motion.section>
+      )}
+
       {/* VS Code Project Builder HUD & Action Trigger HUD */}
       <div className="relative w-full max-w-lg mx-auto z-20 mb-6 flex flex-col gap-3" id="interactive-hud-panel">
+        {/* Phase 3: multi-step desktop task status */}
+        <AnimatePresence>
+          {taskState && taskState.state !== "idle" && taskState.steps.length > 0 && (
+            <motion.div
+              initial={{ opacity: 0, y: 20, scale: 0.96 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.96 }}
+              className="glass-panel rounded-2xl p-4 flex flex-col gap-2.5 shadow-xl border border-purple-500/25 bg-slate-900/90 backdrop-blur-xl"
+              id="desktop-task-panel"
+            >
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex items-center gap-2 min-w-0">
+                  <AppWindow
+                    className={`w-4 h-4 shrink-0 ${
+                      taskState.state === "running" ? "text-purple-300" : "text-slate-400"
+                    }`}
+                  />
+                  <span className="font-mono text-[10px] uppercase tracking-wider text-slate-200 font-bold">
+                    Desktop Task
+                  </span>
+                  <span
+                    className={`text-[9px] font-mono px-2 py-0.5 rounded-full border ${
+                      taskState.state === "running"
+                        ? "bg-purple-950/60 text-purple-200 border-purple-500/40"
+                        : taskState.state === "completed"
+                          ? "bg-emerald-950/60 text-emerald-300 border-emerald-500/40"
+                          : "bg-red-950/50 text-red-300 border-red-500/40"
+                    }`}
+                  >
+                    {taskState.state}
+                  </span>
+                </div>
+                <span className="text-[9px] font-mono text-slate-500 shrink-0">
+                  {taskState.completedCount}/{taskState.steps.length}
+                </span>
+              </div>
+
+              <div className="flex flex-col gap-1">
+                {taskState.steps.map((step) => (
+                  <div key={step.index} className="flex items-start gap-2 text-[11px] py-0.5">
+                    {step.state === "done" ? (
+                      <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0 mt-0.5" />
+                    ) : step.state === "running" ? (
+                      <div className="w-3.5 h-3.5 border-2 border-t-transparent border-purple-400 rounded-full animate-spin shrink-0 mt-0.5" />
+                    ) : step.state === "failed" ? (
+                      <AlertCircle className="w-3.5 h-3.5 text-red-400 shrink-0 mt-0.5" />
+                    ) : (
+                      <Clock className="w-3.5 h-3.5 text-slate-600 shrink-0 mt-0.5" />
+                    )}
+                    <span
+                      className={`${
+                        step.state === "done"
+                          ? "text-slate-300"
+                          : step.state === "failed"
+                            ? "text-red-200"
+                            : step.state === "running"
+                              ? "text-slate-100"
+                              : "text-slate-500"
+                      }`}
+                    >
+                      {step.summary}
+                    </span>
+                  </div>
+                ))}
+              </div>
+
+              {taskState.detail && (
+                <p
+                  className={`text-[10px] rounded-lg px-2 py-1.5 border ${
+                    taskState.state === "failed"
+                      ? "text-red-300 bg-red-950/40 border-red-500/30"
+                      : "text-slate-400 bg-slate-950/50 border-white/5"
+                  }`}
+                >
+                  {taskState.detail}
+                </p>
+              )}
+
+              {taskState.state === "running" ? (
+                <p className="text-[9px] font-mono text-slate-500">
+                  Say &quot;stop&quot; or &quot;ruko&quot; to cancel.
+                </p>
+              ) : (
+                <button
+                  onClick={() => setTaskState(null)}
+                  className="self-end text-[9px] font-mono uppercase tracking-wider text-slate-500 hover:text-slate-300 transition-colors"
+                >
+                  Dismiss
+                </button>
+              )}
+            </motion.div>
+          )}
+        </AnimatePresence>
+
         {/* Current File Context */}
         <AnimatePresence>
           {(fileState?.active || fileState?.status === "reading" || fileState?.lastError) && (
@@ -960,6 +1382,8 @@ export default function App() {
                         <FolderTree className="w-3.5 h-3.5 text-emerald-400" />
                       ) : tool.name === "fileControl" ? (
                         <FileText className="w-3.5 h-3.5 text-amber-400" />
+                      ) : tool.name === "appControl" || tool.name === "taskControl" ? (
+                        <AppWindow className="w-3.5 h-3.5 text-sky-400" />
                       ) : (
                         <Globe className="w-3.5 h-3.5 text-purple-400" />
                       )}
@@ -1008,6 +1432,19 @@ export default function App() {
         {/* Column 3: Control Buttons */}
         <div className="flex items-center justify-center md:justify-end space-x-4">
           <button
+            onClick={() => setInterviewOpen((value) => !value)}
+            className={`px-3 py-2 rounded-xl border font-mono text-[10px] font-bold tracking-widest transition-all duration-300 flex items-center gap-2 shadow-sm ${
+              interviewOpen
+                ? "bg-purple-950/40 border-purple-500/30 text-purple-300"
+                : "bg-slate-900/60 border-white/10 text-slate-400 hover:text-purple-200 hover:border-purple-500/30"
+            }`}
+            id="toggle-interview-mode-btn"
+            title="Project Intelligence & Interview Mode"
+          >
+            <GraduationCap className="w-3.5 h-3.5" />
+            {interviewOpen ? "HIDE INTERVIEW" : "INTERVIEW"}
+          </button>
+          <button
             onClick={openFileFromDesktop}
             className="w-10 h-10 rounded-xl glass-panel border border-white/10 flex items-center justify-center text-slate-400 hover:text-amber-200 hover:bg-white/5 transition-all shadow-sm"
             title="Open a file for Myra"
@@ -1015,6 +1452,21 @@ export default function App() {
           >
             <FileText className="w-4 h-4" />
           </button>
+          {electronMode && (
+            <button
+              onClick={() => setRemotePanelOpen((open) => !open)}
+              className={`px-3 py-2 rounded-xl border font-mono text-[10px] font-bold tracking-widest transition-all duration-300 flex items-center gap-2 shadow-sm ${
+                remotePanelOpen
+                  ? "bg-cyan-950/40 border-cyan-500/30 text-cyan-400"
+                  : "bg-slate-900/60 border-white/10 text-slate-400 hover:text-cyan-200 hover:border-cyan-500/30"
+              }`}
+              id="toggle-phone-panel-btn"
+              title="Phone remote pairing info"
+            >
+              <Smartphone className="w-3.5 h-3.5" />
+              {remotePanelOpen ? "HIDE PHONE" : "PHONE REMOTE"}
+            </button>
+          )}
           <button 
             onClick={handleToggle}
             className={`px-5 py-2 rounded-xl border font-mono text-[10px] font-bold tracking-widest transition-all duration-300 flex items-center gap-2 shadow-sm ${
@@ -1031,7 +1483,11 @@ export default function App() {
             ) : (
               <Power className="w-3.5 h-3.5" />
             )}
-            {state === "disconnected" ? "CONNECT VOICE" : state === "connecting" ? "SYNCING..." : "DISCONNECT"}
+            {state === "disconnected"
+              ? "CONNECT VOICE"
+              : state === "connecting"
+                ? "SYNCING..."
+                : "DISCONNECT"}
           </button>
 
           {executedTools.length > 0 && (
@@ -1045,6 +1501,16 @@ export default function App() {
           )}
         </div>
       </footer>
+
+      <InterviewMode
+        open={interviewOpen}
+        onClose={() => setInterviewOpen(false)}
+        electronMode={electronMode}
+        voiceState={state}
+        voiceTranscript={voiceTranscript}
+        onStartVoice={startInterviewVoice}
+        onStopVoice={stopInterviewVoice}
+      />
     </div>
   );
 }

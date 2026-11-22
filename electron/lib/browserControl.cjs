@@ -48,6 +48,7 @@ const YT_SEARCH_PREFIX = "https://www.youtube.com/results?search_query=";
 
 const BROWSER_ACTIONS = new Set([
   "open",
+  "newTab",
   "search",
   "listVideos",
   "clickVideo",
@@ -72,6 +73,11 @@ const BROWSER_ACTIONS = new Set([
   "maximize",
   "minimize",
   "restore",
+  // Browser WINDOW fullscreen (Chromium window state), distinct from the
+  // YouTube player fullscreen above ("fullscreen"/"exitFullscreen").
+  "windowFullscreen",
+  "windowExitFullscreen",
+  "getWindowState",
 ]);
 
 // A user says "close the browser"; the model may emit any of these. All of them
@@ -86,6 +92,17 @@ const WINDOW_ACTION_ALIASES = new Map([
   ["unminimize", "restore"],
   ["normal", "restore"],
   ["restoreWindow", "restore"],
+  ["windowfullscreen", "windowFullscreen"],
+  ["browserfullscreen", "windowFullscreen"],
+  ["fullscreenwindow", "windowFullscreen"],
+  ["browserfullscreenon", "windowFullscreen"],
+  ["windowexitfullscreen", "windowExitFullscreen"],
+  ["exitbrowserfullscreen", "windowExitFullscreen"],
+  ["leavebrowserfullscreen", "windowExitFullscreen"],
+  ["browserfullscreenoff", "windowExitFullscreen"],
+  ["getwindowstate", "getWindowState"],
+  ["windowstate", "getWindowState"],
+  ["browserstate", "getWindowState"],
 ]);
 
 const SHORTS_URL = "https://www.youtube.com/shorts/";
@@ -200,12 +217,24 @@ function resolveBrowserAction(rawArgs) {
   // Case-insensitive canonical match, so "nextshort" / "NextShort" both work.
   const canonical =
     [...BROWSER_ACTIONS].find((name) => name.toLowerCase() === requestedLower) || null;
-  const action =
+  let action =
     WINDOW_ACTION_ALIASES.get(requested) ||
     WINDOW_ACTION_ALIASES.get(requestedLower) ||
     BROWSER_ACTION_ALIASES.get(requestedLower) ||
     canonical ||
     requested;
+
+  // "fullscreen" is ambiguous on its own: YouTube player fullscreen vs the
+  // whole browser window. An explicit target decides; without one the historic
+  // meaning (video player) is kept. "Browser fullscreen karo" therefore only
+  // affects the window when the model says target: "browser".
+  const target = String(args.target || "").trim().toLowerCase();
+  const browserTarget = target === "browser" || target === "window";
+  const videoTarget = target === "video" || target === "player" || target === "youtube";
+  if (browserTarget && action === "fullscreen") action = "windowFullscreen";
+  if (browserTarget && action === "exitFullscreen") action = "windowExitFullscreen";
+  if (videoTarget && action === "windowFullscreen") action = "fullscreen";
+  if (videoTarget && action === "windowExitFullscreen") action = "exitFullscreen";
 
   if (action === "playPause") {
     // Explicit state wins; a bare "playPause" keeps the historical toggle.
@@ -302,6 +331,17 @@ function normalizeVolumeLevel(args) {
   const n = Number(raw);
   if (!Number.isFinite(n)) return { ok: false, error: "missingVolumeLevel" };
   return { ok: true, level: Math.min(Math.max(Math.round(n), 0), MAX_VOLUME_PERCENT) };
+}
+
+/** Normalise a model/user window-state phrase to a Chromium window state. */
+function normalizeWindowStateArg(value) {
+  const v = String(value == null ? "" : value).trim().toLowerCase();
+  if (!v) return null;
+  if (["fullscreen", "browserfullscreen", "full-screen"].includes(v)) return "fullscreen";
+  if (["maximized", "maximize", "maximised", "maximise"].includes(v)) return "maximized";
+  if (["minimized", "minimize", "minimised", "minimise"].includes(v)) return "minimized";
+  if (["normal", "restore", "restored", "windowed", "unmaximize"].includes(v)) return "normal";
+  return null;
 }
 
 function parseShortsState(raw) {
@@ -1829,7 +1869,7 @@ function createBrowserController({ audit, userDataDir, log } = {}) {
     const action = enter ? "fullscreen" : "exitFullscreen";
     const p = await getPage();
     const info = parseShortsState(await p.evaluate(playerScript(enter ? "fullscreen" : "exitFullscreen")));
-    if (!info.found) return { ok: false, action, error: "noVideoOnPage" };
+    if (!info.found) return { ok: false, action, target: "video", error: "noVideoOnPage" };
     if (info.error) return { ok: false, action, error: "fullscreenFailed", detail: String(info.error) };
 
     const fullscreen = info.fullscreen === true;
@@ -1837,14 +1877,28 @@ function createBrowserController({ audit, userDataDir, log } = {}) {
       return {
         ok: false,
         action,
+        target: "video",
         error: "fullscreenBlocked",
         detail: "The page did not enter fullscreen; the browser may require a direct click.",
       };
     }
     if (!enter && fullscreen) {
-      return { ok: false, action, error: "exitFullscreenBlocked", detail: "The page is still fullscreen." };
+      return {
+        ok: false,
+        action,
+        target: "video",
+        error: "exitFullscreenBlocked",
+        detail: "The page is still fullscreen.",
+      };
     }
-    return { ok: true, action, mode: info.mode, fullscreen, title: capText(info.title, MAX_TITLE_LEN) };
+    return {
+      ok: true,
+      action,
+      target: "video",
+      mode: info.mode,
+      fullscreen,
+      title: capText(info.title, MAX_TITLE_LEN),
+    };
   }
 
   async function actionRestart() {
@@ -1893,6 +1947,50 @@ function createBrowserController({ audit, userDataDir, log } = {}) {
       await sleep(200);
     }
     return false;
+  }
+
+  /**
+   * Open a NEW tab in Myra's existing browser window and keep the current tab.
+   * "open another tab" / "naya tab kholo". The new tab becomes the active page.
+   */
+  async function actionNewTab(args) {
+    const activePort = await ensureBrowser();
+    const requested = typeof args.url === "string" ? args.url.trim() : "";
+    let url = "about:blank";
+    if (requested) {
+      const check = validateNavigationUrl(requested);
+      if (!check.ok) return { ok: false, action: "newTab", error: check.reason };
+      url = check.url;
+    }
+
+    const created = await cdpHttp(activePort, "/json/new?url=" + encodeURIComponent(url), "PUT");
+    if (!created || typeof created.webSocketDebuggerUrl !== "string") {
+      return { ok: false, action: "newTab", error: "newTabFailed" };
+    }
+
+    if (page) {
+      page.close();
+      page = null;
+    }
+    page = await openCdpPage(created.webSocketDebuggerUrl);
+    pageId = created.id || null;
+    try {
+      await page.send("Page.enable");
+      await page.send("Runtime.enable");
+    } catch {
+      /* non-fatal */
+    }
+    await waitForReady(page, 8000);
+
+    const snapshot = await readPage(page).catch(() => ({ url, title: "", results: [] }));
+    const tabs = (await listPageTargets(activePort)).length;
+    return {
+      ok: true,
+      action: "newTab",
+      url: snapshot.url || url,
+      title: capText(snapshot.title, MAX_TITLE_LEN),
+      tabs,
+    };
   }
 
   /** Close Myra's CURRENT TAB, resolved from the live target list. */
@@ -2039,36 +2137,63 @@ function createBrowserController({ audit, userDataDir, log } = {}) {
     };
   }
 
+  /** Chromium window states accepted by Browser.setWindowBounds. */
+  const WINDOW_STATES = new Set(["normal", "minimized", "maximized", "fullscreen"]);
+
+  /**
+   * Drop a dead page handle after a window transition. The next action then
+   * reattaches to the live target; the same tab is reused (pageId is kept).
+   * Coordinates are never cached — every action reads the DOM live — so a state
+   * transition cannot leave stale coordinates behind.
+   */
+  function refreshAutomationContext() {
+    if (page && page.closed) {
+      page = null;
+      pageId = null;
+    }
+  }
+
+  /** Browser window state + the CDP context used to change it (never launches). */
+  async function currentWindowState() {
+    const ctx = await windowContext();
+    if (!ctx.ok) return { ok: false, error: ctx.error };
+    const current = await readWindowState(ctx.browserWs, ctx.targetId);
+    if (!current.ok) return { ok: false, error: current.error };
+    return { ok: true, ctx, current };
+  }
+
   /**
    * Apply a window state to Myra's own window and VERIFY it took effect.
-   * "restore" maps to Chromium's "normal", which is also the un-maximize
-   * transition. Windows cannot jump minimized -> maximized directly, so that
-   * case is normalised through "normal" first.
+   * "restore" maps to Chromium's "normal". "fullscreen" is the BROWSER WINDOW
+   * state (not the YouTube player, which is actionFullscreen/playerScript).
+   * Windows cannot jump minimized -> maximized/fullscreen, so those transitions
+   * are normalised through "normal" first.
    */
   async function actionWindowState(wanted) {
-    const ctx = await windowContext();
-    if (!ctx.ok) return { ok: false, action: wanted, error: ctx.error };
-
-    const current = await readWindowState(ctx.browserWs, ctx.targetId);
-    if (!current.ok) return { ok: false, action: wanted, error: current.error };
-
-    // "restore" means: back to a normal, usable size.
-    //   minimized -> Windows un-minimises to the size the window had BEFORE it
-    //                was minimized (possibly maximized), so both are valid
-    //   maximized -> un-maximise to normal
-    //   normal    -> already there, nothing to change
-    let targetState;
-    let accepted;
-    if (wanted === "restore") {
-      targetState = "normal";
-      accepted = current.state === "minimized" ? ["normal", "maximized"] : ["normal"];
-    } else {
-      targetState = wanted;
-      accepted = [targetState];
+    const targetState = wanted === "restore" ? "normal" : wanted;
+    if (!WINDOW_STATES.has(targetState)) {
+      return { ok: false, action: wanted, error: "unsupportedWindowState", target: "browser" };
     }
 
-    if (current.state === "minimized" && targetState === "maximized") {
-      // Windows cannot jump minimized -> maximized directly.
+    const status = await currentWindowState();
+    if (!status.ok) return { ok: false, action: wanted, error: status.error, target: "browser" };
+    const { ctx, current } = status;
+
+    // Nothing to do: never resize a window that is already in the wanted state
+    // (this is what keeps a fullscreen session fullscreen).
+    if (current.state === targetState) {
+      return {
+        ok: true,
+        action: wanted,
+        state: wanted === "restore" ? "restored" : current.state,
+        windowState: current.state,
+        target: "browser",
+        unchanged: true,
+      };
+    }
+
+    if (current.state === "minimized" && targetState !== "normal") {
+      // Windows cannot jump minimized -> maximized/fullscreen directly.
       await runBrowserCommand(ctx.browserWs, "Browser.setWindowBounds", {
         windowId: current.windowId,
         bounds: { windowState: "normal" },
@@ -2082,11 +2207,12 @@ function createBrowserController({ audit, userDataDir, log } = {}) {
     });
     if (!set.ok) {
       record("BROWSER_WINDOW_FAILED", { tool: wanted });
-      return { ok: false, action: wanted, error: set.error };
+      return { ok: false, action: wanted, error: set.error, target: "browser" };
     }
 
-    // Bring it forward for maximize/restore (never for minimize).
-    if (targetState !== "minimized") {
+    // Bring the SAME tab forward for maximize/restore. Never for minimize, and
+    // never while entering fullscreen (activation is unnecessary there).
+    if (targetState === "maximized" || targetState === "normal") {
       await runBrowserCommand(ctx.browserWs, "Target.activateTarget", { targetId: ctx.targetId });
     }
 
@@ -2097,24 +2223,127 @@ function createBrowserController({ audit, userDataDir, log } = {}) {
       const now = await readWindowState(ctx.browserWs, ctx.targetId);
       if (now.ok) {
         state = now.state;
-        if (accepted.includes(state)) break;
+        if (state === targetState) break;
       }
       await sleep(200);
     }
 
+    // Leaving fullscreen can land on "maximized"; when a normal window was
+    // requested, make that explicit instead of calling it normal.
+    if (targetState === "normal" && state === "maximized") {
+      await runBrowserCommand(ctx.browserWs, "Browser.setWindowBounds", {
+        windowId: current.windowId,
+        bounds: { windowState: "normal" },
+      });
+      await sleep(250);
+      const now = await readWindowState(ctx.browserWs, ctx.targetId);
+      if (now.ok) state = now.state;
+    }
+
+    // The automation context must never hold a handle that died mid-transition.
+    refreshAutomationContext();
     record("BROWSER_WINDOW_STATE", { tool: wanted });
 
-    if (accepted.includes(state)) {
+    if (state === targetState) {
       return {
         ok: true,
         action: wanted,
         state: wanted === "restore" ? "restored" : state,
-        // Actual state, so an un-minimise that lands maximized is reported
-        // accurately instead of being called plain "normal".
+        // Actual state, read back from the browser, never assumed.
         windowState: state,
+        windowStateBefore: current.state,
+        target: "browser",
       };
     }
-    return { ok: false, action: wanted, error: "windowStateUnchanged", state };
+    return {
+      ok: false,
+      action: wanted,
+      error: "windowStateUnchanged",
+      state,
+      windowState: state,
+      windowStateBefore: current.state,
+      target: "browser",
+    };
+  }
+
+  /** "Browser fullscreen karo" — the whole Chromium window, not the video. */
+  async function actionWindowFullscreen() {
+    const result = await actionWindowState("fullscreen");
+    return { ...result, action: "windowFullscreen", target: "browser" };
+  }
+
+  /** Leave browser-window fullscreen and return to a normal window. */
+  async function actionWindowExitFullscreen() {
+    const result = await actionWindowState("normal");
+    return { ...result, action: "windowExitFullscreen", target: "browser" };
+  }
+
+  /** "What state is the browser in?" — read-only, never launches a browser. */
+  async function actionGetWindowState() {
+    const status = await currentWindowState();
+    if (!status.ok) return { ok: false, action: "getWindowState", error: status.error, target: "browser" };
+    const state = status.current.state;
+
+    // Chromium also reports windowState "fullscreen" while a PAGE element is in
+    // HTML fullscreen (a YouTube video). DOM fullscreen is what tells the two
+    // apart, so read it instead of guessing from the window state alone.
+    let pageFullscreen = null;
+    if (state === "fullscreen") {
+      try {
+        const p = await getPage();
+        pageFullscreen = (await p.evaluate("!!document.fullscreenElement")) === true;
+      } catch {
+        pageFullscreen = null;
+      }
+    }
+
+    return {
+      ok: true,
+      action: "getWindowState",
+      target: "browser",
+      windowId: status.current.windowId,
+      windowState: state,
+      isFullscreen: state === "fullscreen",
+      isMaximized: state === "maximized",
+      isMinimized: state === "minimized",
+      isNormal: state === "normal",
+      isPageFullscreen: pageFullscreen === true,
+      // "browser" = the whole window, "video" = a page element (YouTube player).
+      fullscreenKind:
+        state === "fullscreen"
+          ? pageFullscreen === true
+            ? "video"
+            : pageFullscreen === false
+            ? "browser"
+            : "unknown"
+          : null,
+    };
+  }
+
+  /**
+   * "Fullscreen se bahar aao". If the WINDOW is fullscreen, exit that first;
+   * otherwise only the YouTube player is toggled. Never confuses the two.
+   */
+  async function actionExitFullscreenSmart() {
+    const status = await currentWindowState();
+    if (status.ok && status.current.state === "fullscreen") {
+      // Chromium reports windowState "fullscreen" for HTML (video) fullscreen
+      // too. Only exit the WINDOW when no page element is fullscreen; otherwise
+      // exit the player (which also returns the window to normal).
+      let pageFullscreen = null;
+      try {
+        const p = await getPage();
+        pageFullscreen = (await p.evaluate("!!document.fullscreenElement")) === true;
+      } catch {
+        pageFullscreen = null;
+      }
+      if (pageFullscreen !== true) {
+        const result = await actionWindowState("normal");
+        return { ...result, action: "exitFullscreen", mode: "browser", target: "browser" };
+      }
+    }
+    const video = await actionFullscreen(false);
+    return { ...video, target: "video" };
   }
 
   // --- public API -----------------------------------------------------------
@@ -2135,9 +2364,38 @@ function createBrowserController({ audit, userDataDir, log } = {}) {
     record("BROWSER_ACTION", { tool: action });
 
     try {
-      switch (action) {
+      // An explicit windowState is applied BEFORE the requested action, so
+      // "search YouTube in fullscreen" runs inside the fullscreen window
+      // instead of resizing it afterwards.
+      const requestedWindowState = normalizeWindowStateArg(args.windowState);
+      const windowActions = new Set([
+        "maximize",
+        "minimize",
+        "restore",
+        "windowFullscreen",
+        "windowExitFullscreen",
+        "getWindowState",
+      ]);
+      let appliedWindowState = null;
+      if (requestedWindowState && !windowActions.has(action)) {
+        const applied = await actionWindowState(requestedWindowState);
+        if (!applied.ok) {
+          return {
+            ok: false,
+            action,
+            error: applied.error || "windowStateFailed",
+            windowState: applied.windowState,
+          };
+        }
+        appliedWindowState = applied.windowState;
+      }
+
+      const execute = async () => {
+        switch (action) {
         case "open":
           return await actionOpen(args);
+        case "newTab":
+          return await actionNewTab(args);
         case "search":
           return await actionSearch(args);
         case "listVideos":
@@ -2171,7 +2429,7 @@ function createBrowserController({ audit, userDataDir, log } = {}) {
         case "fullscreen":
           return await actionFullscreen(true);
         case "exitFullscreen":
-          return await actionFullscreen(false);
+          return await actionExitFullscreenSmart();
         case "restart":
           return await actionRestart();
         case "back":
@@ -2186,9 +2444,24 @@ function createBrowserController({ audit, userDataDir, log } = {}) {
           return await actionWindowState("minimized");
         case "restore":
           return await actionWindowState("restore");
+        case "windowFullscreen":
+          return await actionWindowFullscreen();
+        case "windowExitFullscreen":
+          return await actionWindowExitFullscreen();
+        case "getWindowState":
+          return await actionGetWindowState();
         default:
           return { ok: false, error: "unsupportedAction" };
+        }
+      };
+
+      const result = await execute();
+      if (appliedWindowState && result && typeof result === "object" && result.ok) {
+        // Report the state the action actually ran in.
+        result.windowState = appliedWindowState;
+        result.windowStateApplied = requestedWindowState;
       }
+      return result;
     } catch (err) {
       const reason = String((err && err.message) || "browserError");
       record("BROWSER_ACTION_FAILED", { tool: action, reason: reason.slice(0, 60) });
@@ -2227,6 +2500,7 @@ function createBrowserController({ audit, userDataDir, log } = {}) {
 
 module.exports = {
   createBrowserController,
+  normalizeWindowStateArg,
   validateNavigationUrl,
   isPrivateOrLoopbackHost,
   BROWSER_ACTIONS,

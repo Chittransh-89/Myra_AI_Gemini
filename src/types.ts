@@ -45,4 +45,16 @@ export interface ToolCallUpdate {
   }>;
 }
 
-export type ServerMessage = StatusUpdate | AudioUpdate | InterruptedUpdate | TurnCompleteUpdate | ToolCallUpdate;
+export interface TranscriptUpdate {
+  type: "transcript";
+  role: "interviewer" | "candidate";
+  text: string;
+}
+
+export type ServerMessage =
+  | StatusUpdate
+  | AudioUpdate
+  | InterruptedUpdate
+  | TurnCompleteUpdate
+  | ToolCallUpdate
+  | TranscriptUpdate;

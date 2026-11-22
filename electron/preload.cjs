@@ -41,6 +41,27 @@ contextBridge.exposeInMainWorld("myraDesktop", {
     return ipcRenderer.invoke("myra:tool:execute", payload);
   },
 
+  // --- Phase 3 task status bridge (read-only) ---
+  // Reflects what the main-process task runner is doing. It cannot START or
+  // CANCEL a task: those stay on the authenticated tool path.
+  taskStatus: {
+    get: () => ipcRenderer.invoke("myra:task:state:get"),
+    onState: (callback) => {
+      if (typeof callback !== "function") return () => {};
+      const handler = (_event, state) => callback(state);
+      ipcRenderer.on("myra:task:state", handler);
+      return () => ipcRenderer.removeListener("myra:task:state", handler);
+    },
+  },
+
+  // --- Project Intelligence bridge (native folder picker only) ---
+  // Opens the Windows folder picker and records the chosen root in main. It
+  // exposes no fs API and no file contents; the server performs the read-only
+  // scan of that approved root.
+  projectFolder: {
+    pick: () => ipcRenderer.invoke("myra:project-intel:pick"),
+  },
+
   // --- File context bridge (metadata only; no fs, no content) ---
   // 'pick' opens the native Windows file picker (a user gesture) and returns
   // the resulting context state. It cannot read an arbitrary path. The main

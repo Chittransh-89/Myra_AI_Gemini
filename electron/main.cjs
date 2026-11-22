@@ -44,6 +44,8 @@ const { createWhatsAppBridge } = require("./lib/whatsappControl.cjs");
 const { createPhoneBridge } = require("./lib/phoneControl.cjs");
 const { createProjectControl } = require("./lib/projectControl.cjs");
 const { createFileControl } = require("./lib/fileControl.cjs");
+const { createAppControl } = require("./lib/appControl.cjs");
+const { createTaskRunner } = require("./lib/taskRunner.cjs");
 
 const PORT = parseInt(process.env.PORT || "3000", 10);
 const APP_URL = `http://127.0.0.1:${PORT}`;
@@ -100,6 +102,12 @@ const WS_TOKEN = crypto.randomBytes(32).toString("hex"); // per-run, never logge
 const HANDOFF_NONCE = crypto.randomBytes(32).toString("hex"); // per-run, never logged
 const RECEIPT_KEY_HEX = crypto.randomBytes(32).toString("hex"); // completion HMAC key, shared with the server via env only
 const HANDOFF_PIPE = `myra-handoff-${RUN_ID}`; // nonce-gated; name itself carries no privilege
+
+// Project Intelligence (read-only source analysis). The server may only scan a
+// local folder that the user selected in the native picker; the picker records
+// that root here. This file is never exposed to the renderer.
+const APPROVED_PROJECTS_FILE = path.join(app.getPath("userData"), "approved-project-roots.json");
+const INTELLIGENCE_DATA_DIR = path.join(app.getPath("userData"), "myra-intelligence");
 
 const auditLog = createAuditLogger(app.getPath("userData"), RUN_ID);
 const audit = auditLog.audit.bind(auditLog); // callable used across the trust stack
@@ -176,6 +184,13 @@ const fileControl = createFileControl({
   },
   onState: (state) => broadcastFileState(state),
 });
+// Phase 3: app/window control. Main-process only; the model names an allowlisted
+// app, never an executable, path or command line. No shell is ever used.
+const appControl = createAppControl({
+  audit,
+  log,
+  openExternal: (target) => require("electron").shell.openExternal(target),
+});
 const killSwitch = createKillSwitch((state) => {
   audit(state.engaged ? "KILL_ENGAGED" : "KILL_RELEASED", { reason: state.lastReason });
   log("Kill switch:", state.engaged ? "ENGAGED" : "released", "(" + state.lastReason + ")");
@@ -184,6 +199,19 @@ const killSwitch = createKillSwitch((state) => {
   if (state.engaged && typeof authority.advanceGeneration === "function") {
     authority.advanceGeneration();
   }
+  // Phase 3: an engaged kill switch also stops a running multi-step task
+  // before its next step.
+  if (state.engaged && taskControl) taskControl.cancel("killSwitch");
+});
+// Phase 3: multi-step tasks. Sequentially executes verified desktop steps; it
+// owns the plan -> confirm -> run gate for destructive steps.
+const taskControl = createTaskRunner({
+  audit,
+  log,
+  app: appControl,
+  project: projectControl,
+  killSwitch,
+  onState: (state) => broadcastTaskState(state),
 });
 const authority = createHandoffAuthority({
   audit,
@@ -194,6 +222,8 @@ const authority = createHandoffAuthority({
   phone: phoneControl,
   project: projectControl,
   file: fileControl,
+  app: appControl,
+  task: taskControl,
   emitCompletion: (frame) => (pipeServer ? pipeServer.broadcast(frame) : false),
   notifyExecuting: (callId, sessionId) => {
     if (pipeServer) pipeServer.broadcast({ type: "execStatus", callId, sessionId, state: "executing" });
@@ -209,7 +239,40 @@ function buildServerEnv() {
     MYRA_HANDOFF_PIPE: HANDOFF_PIPE,
     MYRA_HANDOFF_NONCE: HANDOFF_NONCE,
     MYRA_RECEIPT_KEY: RECEIPT_KEY_HEX,
+    MYRA_APPROVED_PROJECTS_FILE: APPROVED_PROJECTS_FILE,
+    MYRA_DATA_DIR: INTELLIGENCE_DATA_DIR,
   };
+}
+
+/**
+ * Record a folder the user approved through the native picker. The server reads
+ * this file and refuses to scan anything else in Electron mode.
+ */
+function recordApprovedProjectRoot(root) {
+  try {
+    const resolved = path.resolve(root);
+    let entries = [];
+    try {
+      const parsed = JSON.parse(fs.readFileSync(APPROVED_PROJECTS_FILE, "utf8"));
+      if (Array.isArray(parsed)) entries = parsed;
+    } catch {
+      entries = [];
+    }
+    const filtered = entries.filter(
+      (entry) => typeof entry?.root === "string" && path.resolve(entry.root) !== resolved
+    );
+    filtered.unshift({ root: resolved, approvedAt: new Date().toISOString() });
+    fs.mkdirSync(path.dirname(APPROVED_PROJECTS_FILE), { recursive: true });
+    fs.writeFileSync(APPROVED_PROJECTS_FILE, JSON.stringify(filtered.slice(0, 50), null, 2), {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+    audit("PROJECT_INTEL_ROOT_APPROVED", { root: resolved });
+    return true;
+  } catch (err) {
+    log("Could not record the approved project folder:", err.message);
+    return false;
+  }
 }
 
 function broadcastFileState(state) {
@@ -217,6 +280,20 @@ function broadcastFileState(state) {
     if (!win.isDestroyed()) {
       try {
         win.webContents.send("myra:file:state", state);
+      } catch {
+        /* window closing */
+      }
+    }
+  }
+}
+
+// Phase 3: task progress mirror for the UI. Metadata only (step summaries and
+// states); it contains no tool arguments, paths or secrets.
+function broadcastTaskState(state) {
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (!win.isDestroyed()) {
+      try {
+        win.webContents.send("myra:task:state", state);
       } catch {
         /* window closing */
       }
@@ -236,6 +313,31 @@ function registerIpcHandlers() {
   ipcMain.handle("myra:file:pick", async () => fileControl.pickFromUi());
   ipcMain.handle("myra:file:state:get", () => fileControl.getState());
   ipcMain.handle("myra:file:close", () => fileControl.closeFromUi());
+
+  // Phase 3: read-only task status for the UI panel. Starting a task stays on
+  // the authenticated tool path (taskControl), never on this bridge.
+  ipcMain.handle("myra:task:state:get", () => taskControl.status());
+
+  // Project Intelligence: the renderer can only OPEN the native folder picker
+  // (a user gesture). It never receives filesystem access, and the server only
+  // scans roots recorded here. Analysis happens in the server, read-only.
+  ipcMain.handle("myra:project-intel:pick", async () => {
+    const parent = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0] || null;
+    const options = {
+      title: "Select a project folder for Myra to read (read-only)",
+      buttonLabel: "Analyse this folder",
+      properties: ["openDirectory"],
+    };
+    const res = parent
+      ? await dialog.showOpenDialog(parent, options)
+      : await dialog.showOpenDialog(options);
+    if (!res || res.canceled || !res.filePaths || res.filePaths.length === 0) {
+      return { canceled: true };
+    }
+    const chosen = res.filePaths[0];
+    const approved = recordApprovedProjectRoot(chosen);
+    return { canceled: false, path: chosen, approved };
+  });
 
   // The renderer's ONLY tool path. Everything is validated inside the
   // authority (signature, registry membership, expiry, single-use, digest).
@@ -974,6 +1076,11 @@ app.on("before-quit", () => {
   try {
     // CDP sockets only — the browser window stays open for the user.
     browserControl.dispose();
+  } catch {}
+  try {
+    taskControl.cancel("appQuit");
+    taskControl.dispose();
+    appControl.dispose();
   } catch {}
   authority.abortPending("appQuit");
   killServerChild();

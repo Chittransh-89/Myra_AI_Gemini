@@ -95,6 +95,13 @@ export interface AIProviderSessionCallbacks {
 
   /** Called when the provider connection closes (cleanly or otherwise). */
   onClose: (reason?: string) => void;
+
+  /**
+   * Optional speech transcription supplied by providers that support it.
+   * Used by Interview Mode to record a spoken interview; the voice pipeline
+   * itself is unchanged.
+   */
+  onTranscript?: (role: "user" | "model", text: string) => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -112,6 +119,13 @@ export interface AIProviderSession {
    * Send tool execution results back to the AI model.
    */
   sendToolResponse(responses: FunctionResponse[]): void;
+
+  /**
+   * Send a text turn through the existing session (used to make the same voice
+   * read out a generated interview question). Optional: providers that cannot
+   * carry text simply do not implement it.
+   */
+  sendText?(text: string): void;
 
   /**
    * Gracefully terminate the session.

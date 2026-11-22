@@ -28,6 +28,9 @@ function sanitizeField(name, value) {
   const ALLOWED = new Set([
     "event", "ts", "runId", "callId", "tool", "argsDigest", "reason",
     "source", "transport", "pipeState", "ttlMs", "triggers", "medium",
+    // Phase 3 desktop automation: allowlist KEY (never a path), closed-set
+    // action name, and a step index. No user data, no file paths, no secrets.
+    "app", "action", "step",
   ]);
   if (!ALLOWED.has(name)) return { name: "__dropped_field__", value: REDACTED };
   let text;

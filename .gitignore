@@ -16,6 +16,8 @@ release/
 # --- App-specific ---
 .freebuff/
 assets/.aistudio/
+# Project Intelligence store (analysed projects, interviews, reports)
+.myra-data/
 
 # --- Logs ---
 *.log

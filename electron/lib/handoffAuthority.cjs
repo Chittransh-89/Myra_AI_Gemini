@@ -42,7 +42,7 @@ const DEFAULT_TICKET_TTL_MS = 20000;
 // Both are declared builtin names; nothing else may be registered.
 // WhatsApp and Phone Link joined later: both are main-executed so no renderer
 // code ever authors a Gemini-visible messaging result.
-const EXECUTOR_NAMES = new Set(["getSystemTime", "openWebsite", "browserControl", "whatsappControl", "phoneControl", "projectControl", "fileControl"]);
+const EXECUTOR_NAMES = new Set(["getSystemTime", "openWebsite", "browserControl", "whatsappControl", "phoneControl", "projectControl", "fileControl", "appControl", "taskControl"]);
 const MAX_RESULT_BYTES = 8 * 1024;          // canonical result cap (receipt)
 const MAX_PENDING_PER_CHANNEL = 64;         // concurrent registrations per pipe channel
 
@@ -69,7 +69,7 @@ function toPipePath(name) {
   return name.startsWith("\\\\.\\pipe\\") || name.startsWith("\\\\?\\pipe\\") ? name : "\\\\.\\pipe\\" + name;
 }
 
-function createHandoffAuthority({ audit, killSwitch, receiptKey, emitCompletion, notifyExecuting, browser, whatsapp, phone, project, file }) {
+function createHandoffAuthority({ audit, killSwitch, receiptKey, emitCompletion, notifyExecuting, browser, whatsapp, phone, project, file, app, task }) {
   const hmacKey = crypto.randomBytes(32); // ticket key — never leaves this process, never logged
   if (!Buffer.isBuffer(receiptKey) || receiptKey.length === 0) {
     throw new Error("createHandoffAuthority: receiptKey (Buffer) is required for completion signing");
@@ -139,6 +139,21 @@ function createHandoffAuthority({ audit, killSwitch, receiptKey, emitCompletion,
   // every read requires a user authorization recorded in this session.
   if (file && typeof file.run === "function") {
     executors.set("fileControl", (args) => file.run(args));
+  }
+  // Phase 3: desktop app + window control. Allowlist-only, no shell, verified.
+  if (app && typeof app.run === "function") {
+    executors.set("appControl", (args) => app.run(args));
+  }
+  // Phase 3: multi-step task execution (plan -> run -> status -> cancel).
+  if (task && typeof task.run === "function") {
+    executors.set("taskControl", (args) => {
+      const action = args && args.action;
+      if (action === "plan") return task.plan(args);
+      if (action === "run") return task.run(args);
+      if (action === "status") return task.status();
+      if (action === "cancel") return task.cancel(args && args.reason);
+      return { ok: false, error: "unsupportedAction" };
+    });
   }
   let generation = 0; // bumped by the kill switch; stale async completions are suppressed
   const stats = {
@@ -232,7 +247,12 @@ function createHandoffAuthority({ audit, killSwitch, receiptKey, emitCompletion,
         return { ok: false, reason: "killSwitchActive" };
       }
       if (!isSafeId(callId)) return { ok: false, reason: "malformedCallId" };
-      if (typeof tool !== "string" || !EXECUTOR_NAMES.has(tool)) {
+      // A tool may be registered ONLY when its main-process executor actually
+      // exists for this run. EXECUTOR_NAMES is the static allowlist; executors
+      // is the capability set (filled from the injected controllers). A
+      // mis-configured main process therefore fails closed at registration
+      // instead of advertising a capability it cannot honour.
+      if (typeof tool !== "string" || !EXECUTOR_NAMES.has(tool) || !executors.has(tool)) {
         return { ok: false, reason: "unknownToolName" };
       }
       if (!isSessionId(sessionId)) return { ok: false, reason: "malformedSessionId" };
