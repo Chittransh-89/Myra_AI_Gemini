@@ -3,7 +3,9 @@
  *
  * Owns the import -> analyse -> interview -> report lifecycle and the file store.
  * Transport-agnostic: routes.ts wires it to HTTP, and the existing WS server
- * uses voiceInstruction()/recordTranscript() for Interview Mode voice.
+ * uses voiceInstruction()/answerVoice() for Interview Mode voice. The engine
+ * stays authoritative for every question, assessment and the final report;
+ * the voice model only speaks questions and supplies transcription.
  *
  * Local scanning requires an explicitly approved root (native folder picker in
  * Electron runs). Nothing here writes to, renames or executes project files.
@@ -36,9 +38,12 @@ import {
   type ProjectKnowledge,
 } from "./types.js";
 
-const PENDING_TTL_MS = 30 * 60 * 1000;
+// Imported source stays in memory long enough to retry an analysis without
+// making the user fetch the project again.
+const PENDING_TTL_MS = 2 * 60 * 60 * 1000;
 const MAX_PENDING = 4;
 const MAX_TURNS = 240;
+const DEFAULT_REQUEST_CAP = 40;
 
 export interface IntelligenceServiceOptions {
   dataDir: string;
@@ -46,6 +51,8 @@ export interface IntelligenceServiceOptions {
   electronMode: boolean;
   model: TextModel | null;
   limits?: Partial<ScanLimits>;
+  /** Gemini text requests allowed per analysis run and per interview session. */
+  requestCap?: number;
 }
 
 /** What the UI may see about an imported (not yet analysed) project. */
@@ -78,12 +85,14 @@ export class IntelligenceService {
   private model: TextModel | null;
   private options: IntelligenceServiceOptions;
   private limits: ScanLimits;
+  private requestCap: number;
   private pending = new Map<string, { project: ImportedProject; expiresAt: number }>();
 
   constructor(options: IntelligenceServiceOptions) {
     this.options = options;
     this.model = options.model;
     this.limits = { ...DEFAULT_SCAN_LIMITS, ...(options.limits ?? {}) };
+    this.requestCap = Math.max(1, Math.floor(options.requestCap ?? DEFAULT_REQUEST_CAP));
     this.store = new IntelligenceStore(options.dataDir);
   }
 
@@ -108,6 +117,23 @@ export class IntelligenceService {
       );
     }
     return this.model;
+  }
+
+  /**
+   * Count one Gemini request against an interview before it is sent. The
+   * counter lives on the persisted session, so the cap also holds across
+   * restarts. Quota exhaustion itself is classified in GeminiTextModel.
+   */
+  private reserveInterviewRequest(session: InterviewSession): void {
+    const used = session.requestsUsed ?? 0;
+    if (used + 1 > this.requestCap) {
+      throw new IntelligenceError(
+        "requestCapReached",
+        `This interview reached its Gemini request limit (${this.requestCap}). End it and start a new interview, or raise MYRA_INTELLIGENCE_REQUEST_CAP in the Myra .env file. Retry later.`,
+        429
+      );
+    }
+    session.requestsUsed = used + 1;
   }
 
   private remember(project: ImportedProject): void {
@@ -135,6 +161,9 @@ export class IntelligenceService {
         409
       );
     }
+    // Every retry keeps the imported files alive; a failed analysis never
+    // discards them.
+    entry.expiresAt = Date.now() + PENDING_TTL_MS;
     return entry.project;
   }
 
@@ -168,7 +197,7 @@ export class IntelligenceService {
     if (!this.pending.has(projectId) && existing) return existing;
 
     const project = this.pendingProject(projectId);
-    const knowledge = await buildKnowledge(project, model);
+    const knowledge = await buildKnowledge(project, model, { maxRequests: this.requestCap });
     await this.store.saveProject(knowledge);
     this.pending.delete(projectId);
     console.log(`[intelligence] analysis stored for ${knowledge.projectId} (${knowledge.name})`);
@@ -201,6 +230,7 @@ export class IntelligenceService {
     const model = this.requireModel();
     const knowledge = await this.knowledgeFor(projectId);
     const session = newInterviewSession({ knowledge, type, difficulty });
+    this.reserveInterviewRequest(session);
     const question = await generateNextQuestion(model, session, knowledge);
     if (!question) {
       throw new IntelligenceError("questionGenerationFailed", "The AI could not generate an opening question. Try again.", 502);
@@ -223,6 +253,7 @@ export class IntelligenceService {
     const model = this.requireModel();
     const session = await this.getInterview(interviewId);
     const knowledge = await this.knowledgeFor(session.projectId);
+    this.reserveInterviewRequest(session);
     const result = await submitAnswer(model, session, knowledge, answer);
     await this.store.saveInterview(result.session);
     return result;
@@ -232,6 +263,7 @@ export class IntelligenceService {
     const model = this.requireModel();
     const session = await this.getInterview(interviewId);
     const knowledge = await this.knowledgeFor(session.projectId);
+    this.reserveInterviewRequest(session);
     const hints = await requestHint(model, session, knowledge);
     await this.store.saveInterview(session);
     return hints;
@@ -241,13 +273,17 @@ export class IntelligenceService {
     const model = this.requireModel();
     const session = await this.getInterview(interviewId);
     const knowledge = await this.knowledgeFor(session.projectId);
-    return requestExplanation(model, session, knowledge);
+    this.reserveInterviewRequest(session);
+    const explanation = await requestExplanation(model, session, knowledge);
+    await this.store.saveInterview(session);
+    return explanation;
   }
 
   async skip(interviewId: string) {
     const model = this.requireModel();
     const session = await this.getInterview(interviewId);
     const knowledge = await this.knowledgeFor(session.projectId);
+    if (session.currentQuestion) this.reserveInterviewRequest(session);
     const question = await skipQuestion(model, session, knowledge);
     await this.store.saveInterview(session);
     return { session, question };
@@ -282,6 +318,7 @@ export class IntelligenceService {
     // A paused interview resumed with no open question needs a fresh one.
     if (!session.currentQuestion) {
       const knowledge = await this.knowledgeFor(session.projectId);
+      this.reserveInterviewRequest(session);
       await generateNextQuestion(model, session, knowledge);
     }
     await this.store.saveInterview(session);
@@ -298,6 +335,7 @@ export class IntelligenceService {
 
     const model = this.requireModel();
     const knowledge = await this.knowledgeFor(session.projectId);
+    this.reserveInterviewRequest(session);
     const report = await buildReport(model, session, knowledge);
     await this.store.saveReport(report);
 
@@ -327,6 +365,9 @@ export class IntelligenceService {
    * System-instruction addendum for an interview voice session. Loaded before
    * the existing AI session is created; returns null for an unusable id so the
    * normal assistant voice behaviour is never broken.
+   *
+   * The engine — not the live model — owns the question: if the session has no
+   * open question, one is generated and stored before the voice session starts.
    */
   async voiceInstruction(interviewId: string): Promise<string | null> {
     try {
@@ -334,7 +375,12 @@ export class IntelligenceService {
       if (!session || session.status === "ended") return null;
       const knowledge = await this.knowledgeFor(session.projectId);
       if (session.status === "paused") session.status = "active";
-      return buildVoiceInstruction(session, knowledge);
+      if (!session.currentQuestion) {
+        this.reserveInterviewRequest(session);
+        await generateNextQuestion(this.requireModel(), session, knowledge);
+        await this.store.saveInterview(session);
+      }
+      return buildVoiceInstruction(session);
     } catch (err) {
       console.warn(
         "[intelligence] interview voice context unavailable:",
@@ -342,6 +388,20 @@ export class IntelligenceService {
       );
       return null;
     }
+  }
+
+  /**
+   * Evaluate a spoken answer with the SAME engine the text panel uses, then
+   * return the engine-selected next question for the voice session to read.
+   */
+  async answerVoice(interviewId: string, answer: string) {
+    const model = this.requireModel();
+    const session = await this.getInterview(interviewId);
+    const knowledge = await this.knowledgeFor(session.projectId);
+    this.reserveInterviewRequest(session);
+    const result = await submitAnswer(model, session, knowledge, answer, "voice");
+    await this.store.saveInterview(result.session);
+    return result;
   }
 
   /** Persist a transcript segment produced by the existing voice pipeline. */

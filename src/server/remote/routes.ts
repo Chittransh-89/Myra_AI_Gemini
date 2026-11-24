@@ -555,7 +555,8 @@ export function createRemoteWebSocketServer(options: RemoteWebSocketOptions): Re
     // Phase 2 streaming presence + throttling state for this socket.
     let phoneStreaming = false;
     let lastAudioAt = 0;
-    let lastAudioErrorAt = 0;
+    // Throttle per error code so one failure type cannot hide another.
+    const lastAudioErrorAt = new Map<string, number>();
     const markStreaming = (streaming: boolean) => {
       if (phoneStreaming === streaming) return;
       phoneStreaming = streaming;
@@ -563,8 +564,9 @@ export function createRemoteWebSocketServer(options: RemoteWebSocketOptions): Re
     };
     const sendAudioError = (code: string, message: string) => {
       const now = Date.now();
-      if (now - lastAudioErrorAt < AUDIO_ERROR_THROTTLE_MS) return;
-      lastAudioErrorAt = now;
+      const last = lastAudioErrorAt.get(code) ?? 0;
+      if (now - last < AUDIO_ERROR_THROTTLE_MS) return;
+      lastAudioErrorAt.set(code, now);
       sendJSON(ws, { type: "error", code, message });
     };
     const audioWatchdog = setInterval(() => {
@@ -638,6 +640,13 @@ export function createRemoteWebSocketServer(options: RemoteWebSocketOptions): Re
           break;
 
         case "audio": {
+          // Phone Remote is manual-only: no frame is accepted until the user
+          // explicitly pressed ON on this socket. Connect Voice never sets this.
+          if (!runtime.isPhoneMicEnabled()) {
+            sendAudioError("micNotEnabled", "Phone Remote is OFF. Press Phone Remote ON before sending audio.");
+            break;
+          }
+
           const decoded = decodeAudioFrame(message);
           if (!decoded.ok) {
             if (decoded.code === "audioTooLarge") {
@@ -692,8 +701,17 @@ export function createRemoteWebSocketServer(options: RemoteWebSocketOptions): Re
           break;
         }
 
-        case "audioStop":
+        case "audioStart":
+          // Explicit user action (the Phone Remote ON button).
+          runtime.setPhoneMicEnabled(true);
           markStreaming(false);
+          sendJSON(ws, { type: "remoteState", snapshot: runtime.snapshot() });
+          break;
+
+        case "audioStop":
+          runtime.setPhoneMicEnabled(false);
+          markStreaming(false);
+          sendJSON(ws, { type: "remoteState", snapshot: runtime.snapshot() });
           break;
 
         // Explicit deny: the phone is an audio input, never a tool client.
@@ -714,6 +732,9 @@ export function createRemoteWebSocketServer(options: RemoteWebSocketOptions): Re
 
     ws.on("close", () => {
       clearInterval(audioWatchdog);
+      // A dropped/replaced socket always ends Phone Remote; a reconnect starts
+      // OFF and requires another explicit click.
+      runtime.setPhoneMicEnabled(false);
       markStreaming(false);
       activeSockets.delete(ws);
       if (activeBySession.get(session.id) === ws) {

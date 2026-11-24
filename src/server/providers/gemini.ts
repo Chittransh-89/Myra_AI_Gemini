@@ -10,6 +10,9 @@
  */
 
 import { GoogleGenAI, Modality, Type } from "@google/genai";
+import type { GeminiUsageTracker } from "../geminiUsage.js";
+
+const LIVE_MODEL = "gemini-3.1-flash-live-preview";
 import type {
   AIProvider,
   AIProviderSession,
@@ -211,7 +214,10 @@ export class GeminiProvider implements AIProvider {
   private ai: GoogleGenAI;
   private apiKey: string;
 
-  constructor(apiKey: string) {
+  constructor(
+    apiKey: string,
+    private usage?: GeminiUsageTracker
+  ) {
     this.apiKey = apiKey;
     this.ai = new GoogleGenAI({
       apiKey,
@@ -254,7 +260,7 @@ export class GeminiProvider implements AIProvider {
 
     // Establish the Gemini Live WebSocket session.
     const session = await this.ai.live.connect({
-      model: "gemini-3.1-flash-live-preview",
+      model: LIVE_MODEL,
       config: liveConfig as any,
       callbacks: {
         onmessage: (message: any) => {
@@ -336,6 +342,7 @@ export class GeminiProvider implements AIProvider {
     });
 
     console.log("[GeminiProvider] Live session established");
+    this.usage?.record("live", LIVE_MODEL, "voice");
     return new GeminiSession(session);
   }
 }

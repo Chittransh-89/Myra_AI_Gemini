@@ -43,8 +43,10 @@ import { RemoteRuntime } from "./remote/runtime.js";
 import { RemoteAudioBridge } from "./remote/audioBridge.js";
 import { createRemoteRouter, createRemoteWebSocketServer } from "./remote/routes.js";
 import { IntelligenceService } from "./intelligence/service.js";
+import { engineQuestionPrompt } from "./intelligence/interview.js";
 import { createIntelligenceRouter } from "./intelligence/routes.js";
 import { GeminiTextModel } from "./intelligence/model.js";
+import { GeminiUsageTracker } from "./geminiUsage.js";
 
 // ---------------------------------------------------------------------------
 // T5R Phase B: direct completion constants
@@ -105,20 +107,49 @@ interface ConnectionContext {
 // These were inline in the original server.ts — now isolated here for clarity.
 // ---------------------------------------------------------------------------
 
-const MYRA_SYSTEM_INSTRUCTION = `You are Myraa, a warm, confident and emotionally aware female AI assistant.
-You speak like a real person on a voice call: natural, friendly, and lightly witty.
+const MYRA_SYSTEM_INSTRUCTION = `You are Myraa, a calm, intelligent and emotionally aware female AI assistant.
+You speak like a real person on a voice call: natural, attentive and concise.
 Reply in the user's language (English, Hindi or Hinglish), whichever they used.
 
-RESPONSE STYLE (highest priority):
-- Default answer: 1-3 short spoken sentences. Answer, then stop.
-- A simple question gets a simple answer. Do not explain the obvious.
-- Do not repeat or paraphrase what the user just said.
-- No unnecessary summaries, lectures, bullet lists, caveats, or follow-up questions.
-- Never pad with filler like "I am here", "I understand", "As an AI",
-  "Let me know if you need anything else", or similar.
-- Expand only when the user asks for detail, an explanation, a plan, code, or
-  step-by-step help. Then be complete, structured and technically accurate.
-- Warm but not gushy: at most a light touch of emotion, never overdone.
+RESPONSE STYLE (highest priority). Read the INTENT of the message, not just its
+keywords, then choose the response level:
+- Task or command ("volume badhao", "YouTube kholo", "browser fullscreen karo",
+  "pause karo", "volume 50 kar do"): execute it, then confirm in 1-5 words.
+  Examples: "Done.", "Okay.", "Paused.", "YouTube khol diya.", "Searching."
+  Do not explain the action, repeat the command, add a greeting, add enthusiasm,
+  or ask a follow-up question. When several commands come together, execute all
+  of them and give ONE short acknowledgment. If something fails, say briefly and
+  plainly what failed — never pretend it succeeded.
+- Quick factual question: answer directly in one or two sentences, no preamble.
+- Teaching or explanation request ("samjhao", "detail mein batao", "ye kaise
+  kaam karta hai", "explain with an example", "teach me this", "help me
+  understand"): explain clearly and naturally in a sensible order, with an
+  example when it helps. Match depth to the question; go deeper only when asked.
+  For technical topics, explain the reasoning instead of only dumping code.
+- Complex technical discussion: detailed, structured reasoning when it is
+  genuinely needed.
+- Personal sharing (life, feelings, stress, disappointment, ambition, confusion):
+  respond to the person, not just the problem. Acknowledge what they actually
+  said before anything else, and do not turn it into advice, a checklist or a
+  solution unless they ask for guidance. Don't force positivity or dismiss it
+  with generic motivation. When advice is wanted, be honest and practical. Ask a
+  question only when it genuinely helps the conversation continue. Empathetic,
+  but not dramatic, sentimental or excessively affectionate.
+- Casual conversation: relaxed and natural; don't force it to continue.
+
+Do not make every response the same length. Be concise by default, but never
+shallow when the situation deserves depth.
+
+AVOID:
+- Filler such as "Sure!", "Absolutely!", "Of course!", "I am here", "I understand",
+  "As an AI", "Let me know if you need anything else", or similar.
+- Repeating the same acknowledgment every turn, or sounding like a
+  customer-support chatbot.
+- Using the user's name constantly, overusing emojis, or praising ordinary things.
+- Explaining obvious actions, over-analyzing simple statements, or ending every
+  reply with "Anything else?" or another follow-up question.
+
+Warm but not gushy: at most a light touch of emotion, never overdone.
 
 You MUST avoid any explicit, sexual, offensive, or inappropriate content under any circumstances.
 Maintain a classy, respectful, and highly professional personality at all times.
@@ -884,6 +915,80 @@ function handleConnection(
   // Immediately signal that we are connecting.
   sendJSON(ws, { type: "status", state: "connecting" });
 
+  // --- Interview voice authority ------------------------------------------
+  // The backend engine owns interview progression. In a voice interview the
+  // live model only SPEAKS engine questions and captures the candidate's
+  // speech; the server evaluates the stored transcript and sends the next
+  // engine question through the SAME Gemini Live session (sendText).
+  let interviewAnswerBuffer = "";
+  let interviewAnswerTimer: NodeJS.Timeout | null = null;
+  let interviewEvaluating = false;
+  let interviewClosed = false;
+
+  const speakEngineQuestion = (session: AIProviderSession, question: string) => {
+    try {
+      if (typeof session.sendText !== "function") {
+        console.warn("[interview] provider cannot carry the engine question; voice interview cannot advance");
+        return;
+      }
+      session.sendText(engineQuestionPrompt(question));
+    } catch (err) {
+      console.warn(
+        "[interview] failed to deliver the engine question:",
+        err instanceof Error ? err.message.slice(0, 120) : "unknown"
+      );
+    }
+  };
+
+  const flushInterviewAnswer = () => {
+    if (!intelligence || !interviewId || interviewEvaluating || interviewClosed) return;
+    const answer = interviewAnswerBuffer.replace(/\s+/g, " ").trim();
+    if (!answer) return;
+    interviewAnswerBuffer = "";
+    interviewEvaluating = true;
+    void intelligence
+      .answerVoice(interviewId, answer)
+      .then((result) => {
+        if (interviewClosed) return;
+        sendJSON(ws, {
+          type: "interviewProgress",
+          finished: result.finished,
+          assessment: result.assessment,
+        });
+        if (result.nextQuestion && ctx.session) {
+          speakEngineQuestion(ctx.session, result.nextQuestion.text);
+        }
+      })
+      .catch((err: unknown) => {
+        console.warn(
+          "[interview] answer evaluation failed:",
+          err instanceof Error ? err.message.slice(0, 160) : "unknown"
+        );
+        sendJSON(ws, {
+          type: "interviewError",
+          message: "The interview engine could not evaluate that answer. Please answer again.",
+        });
+      })
+      .finally(() => {
+        interviewEvaluating = false;
+        if (!interviewClosed && interviewAnswerBuffer.trim()) {
+          interviewAnswerTimer = setTimeout(flushInterviewAnswer, 600);
+        }
+      });
+  };
+
+  const scheduleInterviewAnswer = () => {
+    if (interviewAnswerTimer) clearTimeout(interviewAnswerTimer);
+    // Wait for a short silence so a sentence split across transcription
+    // segments is evaluated once, as one answer.
+    interviewAnswerTimer = setTimeout(flushInterviewAnswer, 1400);
+  };
+
+  const clearInterviewTimers = () => {
+    if (interviewAnswerTimer) clearTimeout(interviewAnswerTimer);
+    interviewAnswerTimer = null;
+  };
+
   // Open the provider session asynchronously.
   provider
     .createSession(
@@ -947,11 +1052,25 @@ function handleConnection(
 
         onTranscript(role, text) {
           const mapped = role === "model" ? "interviewer" : "candidate";
-          // The renderer mirrors the transcript; the server is the source of
-          // truth for the interview report.
+          // The renderer mirrors the transcript for live captions only.
           sendJSON(ws, { type: "transcript", role: mapped, text });
           if (intelligence && interviewId) {
-            void intelligence.recordTranscript(interviewId, mapped, text, "voice");
+            // Interview voice is engine-authoritative: only the candidate's
+            // words are buffered. Model speech is never persisted, so an
+            // improvised question can never enter the session record.
+            if (role === "user") {
+              const incoming = String(text).replace(/\s+/g, " ").trim();
+              if (incoming) {
+                if (incoming.startsWith(interviewAnswerBuffer)) {
+                  // Cumulative transcription: the newest chunk contains the turn.
+                  interviewAnswerBuffer = incoming;
+                } else if (!interviewAnswerBuffer.endsWith(incoming)) {
+                  interviewAnswerBuffer = `${interviewAnswerBuffer} ${incoming}`.trim();
+                }
+                interviewAnswerBuffer = interviewAnswerBuffer.slice(-4000);
+                scheduleInterviewAnswer();
+              }
+            }
           }
         },
 
@@ -1048,6 +1167,8 @@ function handleConnection(
   // Clean up when the client disconnects.
   ws.on("close", () => {
     console.log("[server] Client disconnected. Closing AI session...");
+    interviewClosed = true;
+    clearInterviewTimers();
     sessions.delete(sessionId);
     remoteRuntime?.desktopDisconnected(sessionId);
     remoteAudioBridge?.detach(sessionId);
@@ -1192,10 +1313,12 @@ function handleExecStatus(frame: { callId: string; sessionId: string; state: str
 
 export async function startServer(
   provider: AIProvider,
-  config: ServerConfig
+  config: ServerConfig,
+  usage?: GeminiUsageTracker
 ): Promise<ReturnType<typeof http.createServer>> {
   const app = express();
   const server = http.createServer(app);
+  const geminiUsage = usage ?? new GeminiUsageTracker(config.intelligenceDataDir);
 
   const distPath = process.env.MYRA_DIST_DIR
     ? path.resolve(process.env.MYRA_DIST_DIR)
@@ -1258,18 +1381,59 @@ export async function startServer(
   });
 
   // -------------------------------------------------------------------------
+  // Local Gemini usage counter (live sessions + generateContent requests)
+  // -------------------------------------------------------------------------
+  app.get("/api/gemini/usage", (req, res) => {
+    res.setHeader("Cache-Control", "no-store, max-age=0");
+
+    if (config.electronMode) {
+      const supplied =
+        typeof req.headers["x-myra-desktop-token"] === "string"
+          ? req.headers["x-myra-desktop-token"]
+          : "";
+      if (!config.wsAuthToken || !timingSafeEq(supplied, config.wsAuthToken)) {
+        res.status(401).json({ ok: false, error: "unauthorized" });
+        return;
+      }
+    } else {
+      const remote = (req.socket.remoteAddress ?? "").replace(/^::ffff:/, "");
+      if (remote !== "127.0.0.1" && remote !== "::1" && remote !== "localhost") {
+        res.status(403).json({ ok: false, error: "localOnly" });
+        return;
+      }
+    }
+
+    const origin = req.headers.origin;
+    if (typeof origin === "string" && origin) {
+      let sameHost = false;
+      try {
+        sameHost = new URL(origin).host === req.headers.host;
+      } catch {
+        sameHost = false;
+      }
+      if (!sameHost) {
+        res.status(403).json({ ok: false, error: "originRejected" });
+        return;
+      }
+    }
+
+    res.json({ ok: true, usage: geminiUsage.summary() });
+  });
+
+  // -------------------------------------------------------------------------
   // Project Intelligence + Interview Mode (local-only API surface)
   // -------------------------------------------------------------------------
   let intelligence: IntelligenceService | null = null;
   if (config.intelligenceEnabled) {
     const textModel = config.geminiApiKey
-      ? new GeminiTextModel(config.geminiApiKey, config.intelligenceModel)
+      ? new GeminiTextModel(config.geminiApiKey, config.intelligenceModel, geminiUsage)
       : null;
     intelligence = new IntelligenceService({
       dataDir: config.intelligenceDataDir,
       approvedRootsFile: config.approvedProjectsFile,
       electronMode: config.electronMode,
       model: textModel,
+      requestCap: config.intelligenceRequestCap,
     });
     try {
       await intelligence.init();

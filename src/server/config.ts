@@ -80,6 +80,9 @@ export interface ServerConfig {
 
   /** Gemini text model used for analysis and interview questions. */
   intelligenceModel: string;
+
+  /** Max Gemini text requests per analysis run and per interview session. */
+  intelligenceRequestCap: number;
 }
 
 function parseProviderName(raw: string | undefined): AIProviderName {
@@ -102,6 +105,19 @@ function parseHost(raw: string | undefined): string {
   // Desktop-first default: loopback only. HOST=0.0.0.0 restores the old
   // LAN-exposed behaviour for anyone hosting the website version.
   return raw ?? "127.0.0.1";
+}
+
+function parseRequestCap(raw: string | undefined): number {
+  if (raw === undefined || raw.trim() === "") return 40;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 1) {
+    console.warn(
+      `[config] MYRA_INTELLIGENCE_REQUEST_CAP="${raw}" is not a positive integer. ` +
+        "Using the default of 40 requests per analysis/interview session."
+    );
+    return 40;
+  }
+  return value;
 }
 
 const FLAG_TRUE = new Set(["1", "true", "yes", "on"]);
@@ -173,7 +189,8 @@ export function loadConfig(): ServerConfig {
     intelligenceDataDir:
       process.env.MYRA_DATA_DIR?.trim() || path.join(process.cwd(), ".myra-data"),
     approvedProjectsFile: process.env.MYRA_APPROVED_PROJECTS_FILE?.trim() || null,
-    intelligenceModel: process.env.MYRA_INTELLIGENCE_MODEL?.trim() || "gemini-2.5-flash",
+    intelligenceModel: process.env.MYRA_INTELLIGENCE_MODEL?.trim() || "gemini-3.8-flash",
+    intelligenceRequestCap: parseRequestCap(process.env.MYRA_INTELLIGENCE_REQUEST_CAP),
   };
 
   if (websiteMode === "open" || websiteMode === "token") {

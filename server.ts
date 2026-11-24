@@ -17,11 +17,13 @@ dotenv.config();
 import { loadConfig } from "./src/server/config.js";
 import { createProvider } from "./src/server/providers/index.js";
 import { startServer } from "./src/server/index.js";
+import { GeminiUsageTracker } from "./src/server/geminiUsage.js";
 
 async function main() {
   const config = loadConfig();
-  const provider = await createProvider(config);
-  await startServer(provider, config);
+  const usage = new GeminiUsageTracker(config.intelligenceDataDir);
+  const provider = await createProvider(config, usage);
+  await startServer(provider, config, usage);
 }
 
 main().catch((err) => {

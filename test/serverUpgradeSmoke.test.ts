@@ -175,6 +175,9 @@ async function run(): Promise<void> {
 
     const remote = await connect(`ws://127.0.0.1:${port}/remote/ws`, { cookie });
     await remote.next((frame) => frame.type === "remoteState");
+    // Phone Remote is manual-only: arm it explicitly first.
+    remote.ws.send(JSON.stringify({ type: "audioStart" }));
+    await remote.next((frame) => frame.type === "remoteState" && frame.snapshot.mic.enabled === true);
     remote.ws.send(
       JSON.stringify({ type: "audio", data: Buffer.alloc(4).toString("base64") })
     );

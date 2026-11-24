@@ -30,9 +30,12 @@ import {
 } from "../src/server/intelligence/localSource.js";
 import { isInsideRoot } from "../src/server/intelligence/filter.js";
 import { buildKnowledge } from "../src/server/intelligence/knowledge.js";
+import { extractJson, isGeminiQuotaError } from "../src/server/intelligence/model.js";
 import type { TextModel, TextModelRequest } from "../src/server/intelligence/model.js";
 import {
   buildReport,
+  buildVoiceInstruction,
+  engineQuestionPrompt,
   generateNextQuestion,
   newInterviewSession,
   requestHint,
@@ -499,6 +502,461 @@ async function run(): Promise<void> {
     check(report.questions.every((item) => item.answerSummary.length <= 300), "answers must be summarised");
     check(report.weakAreas.includes("error paths"), "weak areas must be preserved");
     check(report.scores.communicationClarity === 90, "component scores must be preserved");
+  }
+
+  // --- 5b. Voice is a voice interface, not an interviewer -----------------
+  {
+    const model = new QueueModel([
+      {
+        stage: "project_understanding",
+        question: "What problem does this project solve?",
+        focus: "purpose",
+        difficulty: "medium",
+        expectedPoints: ["problem", "users"],
+        evidence: [{ file: "src/server.ts" }],
+      },
+      {
+        assessment: {
+          correctness: "solid",
+          score: 82,
+          missing: [],
+          misconceptions: [],
+          needsFollowUp: false,
+          note: "Clear answer.",
+        },
+        next: {
+          stage: "technical_deep_dive",
+          question: "How does GET /health reach its handler?",
+          focus: "request flow",
+          difficulty: "medium",
+          expectedPoints: ["express route", "handler"],
+          evidence: [{ file: "src/server.ts" }],
+        },
+      },
+    ]);
+
+    const knowledge = fixtureKnowledge();
+    const session = newInterviewSession({ knowledge, type: "overview", difficulty: "medium" });
+    await generateNextQuestion(model, session, knowledge);
+    check(!!session.currentQuestion, "the engine must own the first question");
+
+    const instruction = buildVoiceInstruction(session);
+    check(
+      instruction.includes(session.currentQuestion!.text),
+      "the voice interface must be given the engine's exact question"
+    );
+    check(
+      instruction.includes("YOU MUST NOT") && instruction.includes("ask a follow-up of your own"),
+      "the voice interface must be forbidden from inventing questions"
+    );
+    check(
+      !instruction.includes("Start now: greet the candidate") && !instruction.includes("your first single question"),
+      "the voice interface must not be told to conduct the interview itself"
+    );
+
+    const prompted = engineQuestionPrompt(session.currentQuestion!.text);
+    check(prompted.startsWith("QUESTION_FROM_ENGINE:"), "engine questions must be explicitly labelled");
+    check(prompted.includes(session.currentQuestion!.text), "the question text must be delivered verbatim");
+
+    const result = await submitAnswer(model, session, knowledge, "It solves interview practice.", "voice");
+    check(result.assessment.score === 82, "the engine must evaluate a spoken answer");
+    const candidate = session.turns.filter((turn) => turn.role === "candidate");
+    check(candidate.length === 1 && candidate[0].source === "voice", "spoken answers must be stored as voice turns");
+    check(result.nextQuestion?.text.includes("/health"), "the engine must select the next question");
+    check(session.questions.length === 2, "the next question must live in the same session record");
+
+    // The service path used by the voice session (question generation when a
+    // resumed session has none, plus engine evaluation of a spoken answer).
+    const voiceModel = new QueueModel([
+      {
+        stage: "project_understanding",
+        question: "What does this demo project do?",
+        focus: "purpose",
+        difficulty: "easy",
+        expectedPoints: ["purpose"],
+        evidence: [{ file: "src/server.ts" }],
+      },
+      {
+        assessment: {
+          correctness: "solid",
+          score: 75,
+          missing: [],
+          misconceptions: [],
+          needsFollowUp: false,
+          note: "Accurate.",
+        },
+        next: {
+          stage: "technical_deep_dive",
+          question: "Which file boots the API?",
+          focus: "entry point",
+          difficulty: "easy",
+          expectedPoints: ["src/server.ts"],
+          evidence: [{ file: "src/server.ts" }],
+        },
+      },
+    ]);
+    const dir = tempDir("myra-intel-voice-");
+    const service = new IntelligenceService({
+      dataDir: dir,
+      approvedRootsFile: null,
+      electronMode: false,
+      model: voiceModel,
+    });
+    await service.init();
+    await service.storeHandle.saveProject(knowledge);
+    const fresh = newInterviewSession({ knowledge, type: "overview", difficulty: "easy" });
+    await service.storeHandle.saveInterview(fresh);
+
+    const voiceContext = await service.voiceInstruction(fresh.id);
+    check(!!voiceContext && voiceContext.includes("INTERVIEW VOICE INTERFACE"), "voice context must be provided");
+    const resumed = await service.getInterview(fresh.id);
+    check(!!resumed.currentQuestion, "the engine must generate a question before the voice session starts");
+
+    const spoken = await service.answerVoice(fresh.id, "A small Express demo with a health route.");
+    const stored = await service.getInterview(fresh.id);
+    check(spoken.assessment.correctness === "solid", "the engine must assess the stored voice answer");
+    check(
+      stored.turns.some((turn) => turn.role === "candidate" && turn.source === "voice"),
+      "the stored session must contain the voice answer"
+    );
+  }
+
+  // --- 5c. Analysis budgets, bounded retries and honest errors ------------
+  {
+    const fenced = extractJson('```json\n{"a":1}\n```');
+    check((fenced as any).a === 1, "fenced JSON must parse");
+
+    const trailing = extractJson('Here is the result: {"a":[1,2]} — done');
+    check((trailing as any).a.length === 2, "JSON followed by prose must parse");
+
+    const repaired = extractJson('{"a":1,"b":[1,2');
+    check(
+      (repaired as any).a === 1 && (repaired as any).b?.length === 2,
+      "a truncated response must be repaired without inventing fields"
+    );
+
+    let parseError: any = null;
+    try {
+      extractJson("no json here", { finishReason: "MAX_TOKENS" });
+    } catch (err) {
+      parseError = err;
+    }
+    check(parseError instanceof IntelligenceError && parseError.code === "invalidModelJson", "garbage must fail honestly");
+    check(!/reduce the project size/i.test(parseError.message), "the misleading size hint must be gone");
+    check(parseError.message.includes("MAX_TOKENS"), "the real finish reason must be reported");
+
+    class AnalysisModel implements TextModel {
+      readonly name = "fake-analysis";
+      readonly calls: TextModelRequest[] = [];
+
+      constructor(
+        private options: {
+          failAllExtraction?: boolean;
+          failSynthesis?: boolean;
+          oversizedAbove?: number;
+          quotaAt?: "extraction" | "synthesis";
+        } = {}
+      ) {}
+
+      async generateJSON(request: TextModelRequest): Promise<unknown> {
+        this.calls.push(request);
+        if (
+          this.options.quotaAt === "extraction" ||
+          (this.options.quotaAt === "synthesis" && !request.system.includes("project analyst"))
+        ) {
+          throw new IntelligenceError(
+            "quotaExceeded",
+            "Gemini quota exceeded (HTTP 429). No further requests were sent — please retry later.",
+            429
+          );
+        }
+        if (request.system.includes("project analyst")) {
+          if (this.options.failAllExtraction) {
+            throw new IntelligenceError(
+              "invalidModelJson",
+              "The AI response could not be parsed as JSON (finish reason: MAX_TOKENS).",
+              502
+            );
+          }
+          if (this.options.oversizedAbove && request.prompt.length > this.options.oversizedAbove) {
+            throw new IntelligenceError(
+              "modelOutputTruncated",
+              "The AI response hit the 4096-token output limit and was cut off.",
+              502
+            );
+          }
+          const firstFile = request.prompt.match(/### FILE: (.+?)(?: \(truncated\))?\n/)?.[1] ?? "src/app.ts";
+          return {
+            technologies: ["TypeScript"],
+            entryPoints: [{ file: firstFile, symbol: "start" }],
+            modules: [],
+            apiEndpoints: [],
+            dataModels: [],
+            auth: [],
+            externalServices: [],
+            keyFunctions: [],
+            designDecisions: [],
+            limitations: [],
+            unknowns: [],
+            codeSamples: [],
+          };
+        }
+        if (this.options.failSynthesis) {
+          throw new IntelligenceError("modelOutputTruncated", "synthesis hit the output limit", 502);
+        }
+        return { name: "Demo", purpose: "A demo project.", stack: ["TypeScript"] };
+      }
+    }
+
+    const analysisProject = (entries: { path: string; text: string }[]): ImportedProject => {
+      const base = fixtureProject(tempDir("myra-intel-analysis-"));
+      return {
+        ...base,
+        files: entries.map((entry) => ({
+          path: entry.path,
+          text: entry.text,
+          bytes: Buffer.byteLength(entry.text),
+          lines: entry.text.split("\n").length,
+          redactions: 0,
+          truncated: false,
+        })),
+        stats: {
+          files: entries.length,
+          bytes: entries.reduce((sum, entry) => sum + Buffer.byteLength(entry.text), 0),
+          chars: entries.reduce((sum, entry) => sum + entry.text.length, 0),
+          redactions: 0,
+          skipped: 0,
+        },
+      };
+    };
+
+    // Oversized request: the pipeline must SHRINK the request on retry, not
+    // repeat the identical call that just failed.
+    const oversized = new AnalysisModel({ oversizedAbove: 20_000 });
+    const bigFiles = Array.from({ length: 10 }, (_, index) => ({
+      path: `src/c${index}.ts`,
+      text: `export const v${index} = "${"y".repeat(3_800)}";`,
+    }));
+    const oversizedKnowledge = await buildKnowledge(analysisProject(bigFiles), oversized);
+    const extractionCalls = oversized.calls.filter((call) => call.system.includes("project analyst"));
+    check(oversizedKnowledge.entryPoints.length > 0, "a split retry must still yield evidence");
+    check(extractionCalls.length > 1, "an oversized extraction must be split and retried");
+    check(
+      extractionCalls.every((call) => call.maxOutputTokens === 4_096),
+      "every extraction call must enforce the output budget"
+    );
+    check(
+      extractionCalls.every((call) => call.prompt.length <= 30_000),
+      "every extraction prompt must fit the input budget"
+    );
+
+    // Relevance: configs and source outrank tests when the chunk budget binds.
+    const relevance = new AnalysisModel();
+    const relevanceFiles = [
+      { path: "package.json", text: "{}" },
+      { path: "test/feature.test.ts", text: "t".repeat(6_000) },
+      ...Array.from({ length: 6 }, (_, index) => ({
+        path: `src/feature${index}.ts`,
+        text: `export const f${index} = "${"z".repeat(5_900)}";`,
+      })),
+    ];
+    await buildKnowledge(analysisProject(relevanceFiles), relevance, { maxChunks: 1 });
+    const relevancePrompt = relevance.calls.find((call) => call.system.includes("project analyst"))!.prompt;
+    check(relevancePrompt.includes("package.json"), "high-value config must be analysed first");
+    check(
+      !relevancePrompt.includes("test/feature.test.ts"),
+      "low-value tests must not crowd out source files under the budget"
+    );
+
+    // Synthesis failure must degrade honestly: extracted facts survive, the
+    // actual reason is shown, and nothing is invented.
+    const synthesisFailure = new AnalysisModel({ failSynthesis: true });
+    const fallback = await buildKnowledge(
+      analysisProject([{ path: "src/app.ts", text: "export function start() { return 1; }" }]),
+      synthesisFailure
+    );
+    check(fallback.entryPoints.length > 0, "extracted evidence must survive a synthesis failure");
+    check(
+      fallback.warnings.some((warning) => warning.includes("AI synthesis was unavailable") && warning.includes("output limit")),
+      "the actual synthesis failure must be reported"
+    );
+    check(fallback.purpose === "", "no purpose may be invented when synthesis fails");
+
+    // Total extraction failure: real stage + real reason, and the message must
+    // not blame the project size.
+    const failing = new AnalysisModel({ failAllExtraction: true });
+    let analysisFailure: any = null;
+    try {
+      await buildKnowledge(
+        analysisProject([{ path: "src/app.ts", text: "x".repeat(5_000) }]),
+        failing
+      );
+    } catch (err) {
+      analysisFailure = err;
+    }
+    check(
+      analysisFailure instanceof IntelligenceError && analysisFailure.code === "analysisFailed",
+      "an all-chunk failure must be an analysisFailed error"
+    );
+    check(/extracting facts/i.test(analysisFailure.message), "the failing stage must be named");
+    check(!/reduce the project size/i.test(analysisFailure.message), "the misleading size hint must be gone");
+    check(
+      /imported project is still available/i.test(analysisFailure.message),
+      "the message must explain that the import is preserved"
+    );
+
+    // A failed analysis must keep the imported project, so a retry does not
+    // require fetching/importing it again.
+    const sourceDir = tempDir("myra-intel-pending-");
+    write(sourceDir, "src/app.ts", "export function start() { return 1; }");
+    const pendingService = new IntelligenceService({
+      dataDir: tempDir("myra-intel-pending-data-"),
+      approvedRootsFile: null,
+      electronMode: false,
+      model: new AnalysisModel({ failAllExtraction: true }),
+    });
+    await pendingService.init();
+    const imported = await pendingService.importLocal(sourceDir);
+    let firstFailure: any = null;
+    let retryFailure: any = null;
+    try {
+      await pendingService.analyze(imported.projectId);
+    } catch (err) {
+      firstFailure = err;
+    }
+    try {
+      await pendingService.analyze(imported.projectId);
+    } catch (err) {
+      retryFailure = err;
+    }
+    check(firstFailure?.code === "analysisFailed", "the first analysis must report the real failure");
+    check(
+      retryFailure?.code === "analysisFailed",
+      "a retry must reuse the imported files rather than asking for a re-import"
+    );
+
+    // Quota/429 is terminal: stop before retrying or splitting the next chunk.
+    check(isGeminiQuotaError({ status: 429 }), "an HTTP 429 must be classified as quota");
+    check(
+      isGeminiQuotaError(new Error("RESOURCE_EXHAUSTED: quota exceeded")),
+      "RESOURCE_EXHAUSTED must be classified as quota"
+    );
+    check(
+      isGeminiQuotaError(new Error("Request failed with status 429")),
+      "a bare 429 message must be classified as quota"
+    );
+    check(!isGeminiQuotaError(new Error("socket hang up")), "unrelated errors must not be called quota");
+
+    const quotaExtraction = new AnalysisModel({ quotaAt: "extraction" });
+    let quotaFailure: any = null;
+    try {
+      await buildKnowledge(
+        analysisProject([
+          { path: "src/a.ts", text: "a".repeat(9_000) },
+          { path: "src/b.ts", text: "b".repeat(9_000) },
+        ]),
+        quotaExtraction
+      );
+    } catch (err) {
+      quotaFailure = err;
+    }
+    check(
+      quotaFailure instanceof IntelligenceError && quotaFailure.code === "quotaExceeded",
+      "a quota error must surface as quotaExceeded"
+    );
+    check(quotaFailure.status === 429, "quotaExceeded must carry HTTP 429");
+    check(
+      /quota exceeded/i.test(quotaFailure.message) && /retry later/i.test(quotaFailure.message),
+      "the quota message must tell the user to retry later"
+    );
+    check(
+      quotaExtraction.calls.length === 1,
+      "a quota error must not be retried or split into more requests"
+    );
+
+    // A quota hit during synthesis must fail the run, not silently fall back.
+    const quotaSynthesis = new AnalysisModel({ quotaAt: "synthesis" });
+    let synthesisQuota: any = null;
+    try {
+      await buildKnowledge(
+        analysisProject([{ path: "src/app.ts", text: "export function start() { return 1; }" }]),
+        quotaSynthesis
+      );
+    } catch (err) {
+      synthesisQuota = err;
+    }
+    check(synthesisQuota?.code === "quotaExceeded", "synthesis quota must stop the analysis");
+    check(
+      quotaSynthesis.calls.filter((call) => call.system.includes("project analyst")).length === 1,
+      "only the successful extraction may run before a synthesis quota error"
+    );
+
+    // Per-session request cap: stop before exceeding the configured budget.
+    const capped = new AnalysisModel();
+    let capFailure: any = null;
+    try {
+      await buildKnowledge(
+        analysisProject(
+          Array.from({ length: 5 }, (_, index) => ({
+            path: `src/cap${index}.ts`,
+            text: "x".repeat(9_000),
+          }))
+        ),
+        capped,
+        { maxChunks: 3, maxRequests: 2 }
+      );
+    } catch (err) {
+      capFailure = err;
+    }
+    check(
+      capFailure instanceof IntelligenceError && capFailure.code === "requestCapReached",
+      "analysis must stop at the per-session request cap"
+    );
+    check(capFailure.status === 429, "the request cap must be reported as 429");
+    check(capped.calls.length === 2, "the cap must stop before the third Gemini request");
+
+    // The interview cap is persisted on the session and checked before the call.
+    const capModel = new QueueModel([
+      {
+        stage: "project_understanding",
+        question: "What does this demo project do?",
+        focus: "purpose",
+        difficulty: "easy",
+        expectedPoints: ["purpose"],
+        evidence: [{ file: "src/server.ts" }],
+      },
+    ]);
+    const cappedService = new IntelligenceService({
+      dataDir: tempDir("myra-intel-cap-"),
+      approvedRootsFile: null,
+      electronMode: false,
+      model: capModel,
+      requestCap: 1,
+    });
+    await cappedService.init();
+    await cappedService.storeHandle.saveProject(fixtureKnowledge());
+    const cappedInterview = await cappedService.createInterview(
+      fixtureKnowledge().projectId,
+      "overview",
+      "easy"
+    );
+    check(cappedInterview.session.requestsUsed === 1, "one question request must be counted");
+    const reloadedCap = await cappedService.getInterview(cappedInterview.session.id);
+    check(reloadedCap?.requestsUsed === 1, "the request counter must be persisted on the session");
+    let interviewCapError: any = null;
+    try {
+      await cappedService.hint(cappedInterview.session.id);
+    } catch (err) {
+      interviewCapError = err;
+    }
+    check(
+      interviewCapError instanceof IntelligenceError && interviewCapError.code === "requestCapReached",
+      "an interview must reject requests past its session cap"
+    );
+    check(
+      capModel.prompts.length === 1,
+      "the cap must reject before sending another Gemini request"
+    );
   }
 
   // --- 6. Store -----------------------------------------------------------

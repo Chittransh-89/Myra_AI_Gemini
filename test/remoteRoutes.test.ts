@@ -235,6 +235,24 @@ async function run() {
       );
       check(control.type === "error" && control.code === "notImplemented", "control is Phase 3");
 
+      // Manual-only Phone Remote: audio is refused until it is explicitly armed.
+      phoneSocket.send(
+        JSON.stringify({ type: "audio", data: Buffer.alloc(4).toString("base64") })
+      );
+      const notEnabled = await queue.next(
+        function (message) { return message.type === "error" && message.code === "micNotEnabled"; }
+      );
+      check(
+        notEnabled.type === "error" && notEnabled.code === "micNotEnabled",
+        "audio before Phone Remote ON must be rejected"
+      );
+
+      phoneSocket.send(JSON.stringify({ type: "audioStart" }));
+      const armed = await queue.next(
+        function (message) { return message.type === "remoteState" && message.snapshot.mic.enabled === true; }
+      );
+      check(armed.snapshot.mic.enabled === true, "audioStart must arm Phone Remote");
+
       phoneSocket.send(
         JSON.stringify({ type: "audio", data: Buffer.alloc(4).toString("base64") })
       );

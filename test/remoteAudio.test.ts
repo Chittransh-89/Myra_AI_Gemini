@@ -216,14 +216,45 @@ async function run(): Promise<void> {
     const { ws, queue } = await connect(wsUrl, { cookie });
     const initial = await queue.next((message) => message.type === "remoteState");
     check(initial.snapshot.mic.streaming === false, "fresh phone socket must not report streaming");
+    check(initial.snapshot.mic.enabled === false, "Phone Remote must be OFF by default");
+
+    // A Connect Voice connect/disconnect (desktop session attach/detach) must
+    // never touch the phone's manual Phone Remote state.
+    const voiceCycleDetach = bridge.attach("desktop-voice-cycle", { sendAudio: () => {} });
+    voiceCycleDetach();
+    const afterVoiceCycle = await fetch(`${base}/remote/api/state`, { headers: { cookie } });
+    const voiceCycleBody: any = await afterVoiceCycle.json();
+    check(
+      voiceCycleBody.snapshot.mic.enabled === false && voiceCycleBody.snapshot.mic.streaming === false,
+      "a desktop voice connect/disconnect must not enable Phone Remote"
+    );
+
+    // Manual-only: no audio is accepted until the user explicitly turns it ON.
+    const chunk = pcmChunk();
+    ws.send(JSON.stringify({ type: "audio", data: chunk, seq: 7 }));
+    const notEnabled = await queue.next(
+      (message) => message.type === "error" && message.code === "micNotEnabled"
+    );
+    check(notEnabled.code === "micNotEnabled", "audio before Phone Remote ON must be rejected");
+    check(received.length === 0, "audio before Phone Remote ON must never reach Gemini");
+
+    // Phone Remote ON is an explicit client action; it arms the server.
+    ws.send(JSON.stringify({ type: "audioStart" }));
+    const armed = await queue.next(
+      (message) => message.type === "remoteState" && message.snapshot.mic.enabled === true
+    );
+    check(armed.snapshot.mic.enabled === true, "Phone Remote ON must be reflected by the server");
+    check(armed.snapshot.mic.streaming === false, "arming the mic is not the same as streaming");
 
     // Accepted chunk is forwarded byte-for-byte and acknowledged.
-    const chunk = pcmChunk();
     ws.send(JSON.stringify({ type: "audio", data: chunk, seq: 7 }));
     const ack = await queue.next((message) => message.type === "audioAck");
     check(ack.seq === 7, "audioAck must echo the client sequence");
     check(ack.bytes === 3_200, "audioAck must report the decoded byte length");
-    check(received.length === 1 && received[0] === chunk, "the bridge must receive the exact PCM chunk");
+    check(
+      received.filter((item) => item === chunk).length === 1,
+      "the bridge must receive the exact PCM chunk"
+    );
 
     const streaming = await queue.next(
       (message) => message.type === "remoteState" && message.snapshot.mic.streaming === true
@@ -239,7 +270,7 @@ async function run(): Promise<void> {
     const odd = await queue.next((message) => message.type === "error" && message.code === "badAudio");
     check(odd.code === "badAudio", "odd-length PCM must be rejected");
 
-    check(received.length === 1, "rejected payloads must never reach the sink");
+    check(received.filter((item) => item === chunk).length === 1, "rejected payloads must never reach the sink");
 
     // The phone cannot submit tool responses.
     ws.send(JSON.stringify({ type: "toolResponse", functionResponses: [{ name: "openWebsite" }] }));
@@ -248,14 +279,43 @@ async function run(): Promise<void> {
     );
     check(forbidden.code === "forbidden", "tool responses from the phone must be forbidden");
 
-    // audioStop clears streaming immediately.
+    // audioStop clears streaming AND disarms Phone Remote immediately.
     ws.send(JSON.stringify({ type: "audioStop" }));
     await queue.next(
-      (message) => message.type === "remoteState" && message.snapshot.mic.streaming === false
+      (message) =>
+        message.type === "remoteState" &&
+        message.snapshot.mic.streaming === false &&
+        message.snapshot.mic.enabled === false
+    );
+
+    // Frames after OFF are still rejected (no late/queued audio leaks through).
+    // Wait past the micNotEnabled retry throttle from the first assertion.
+    await sleep(2_100);
+    ws.send(JSON.stringify({ type: "audio", data: chunk }));
+    const afterOff = await queue.next(
+      (message) => message.type === "error" && message.code === "micNotEnabled"
+    );
+    check(afterOff.code === "micNotEnabled", "audio after Phone Remote OFF must be rejected");
+    check(received.filter((item) => item === chunk).length === 1, "no frame after OFF may reach the sink");
+
+    // Removing the desktop voice session must not change the manual intent.
+    ws.send(JSON.stringify({ type: "audioStart" }));
+    await queue.next(
+      (message) => message.type === "remoteState" && message.snapshot.mic.enabled === true
+    );
+    detach();
+    const afterDetach = await fetch(`${base}/remote/api/state`, { headers: { cookie } });
+    const afterDetachBody: any = await afterDetach.json();
+    check(
+      afterDetachBody.snapshot.mic.enabled === true,
+      "Connect Voice disconnecting must not silently turn Phone Remote off"
     );
 
     // With no desktop session attached, audio is rejected (Phase 3 dependency).
-    detach();
+    ws.send(JSON.stringify({ type: "audioStart" }));
+    await queue.next(
+      (message) => message.type === "remoteState" && message.snapshot.mic.enabled === true
+    );
     ws.send(JSON.stringify({ type: "audio", data: chunk }));
     const unavailable = await queue.next(
       (message) => message.type === "error" && message.code === "sessionUnavailable"
@@ -264,8 +324,17 @@ async function run(): Promise<void> {
 
     await closeSocket(ws);
 
-    // Oversized chunks are rejected and the socket is closed.
+    // A reconnected phone starts with Phone Remote OFF and must be re-armed.
     const second = await connect(wsUrl, { cookie });
+    const secondInitial = await second.queue.next((message) => message.type === "remoteState");
+    check(secondInitial.snapshot.mic.enabled === false, "a reconnect must not re-enable Phone Remote");
+    check(secondInitial.snapshot.mic.streaming === false, "a reconnect must not stream audio");
+
+    // Oversized chunks are rejected and the socket is closed.
+    second.ws.send(JSON.stringify({ type: "audioStart" }));
+    await second.queue.next(
+      (message) => message.type === "remoteState" && message.snapshot.mic.enabled === true
+    );
     second.ws.send(JSON.stringify({ type: "audio", data: Buffer.alloc(9_000).toString("base64") }));
     const tooLarge = await second.queue.next(
       (message) => message.type === "error" && message.code === "audioTooLarge"
@@ -278,6 +347,7 @@ async function run(): Promise<void> {
     const finalState = await fetch(`${base}/remote/api/state`, { headers: { cookie } });
     const finalBody: any = await finalState.json();
     check(finalBody.snapshot.mic.streaming === false, "closing the phone socket must clear streaming");
+    check(finalBody.snapshot.mic.enabled === false, "closing the phone socket must disable Phone Remote");
 
     console.log("remoteAudio: all checks passed");
   } finally {

@@ -41,7 +41,12 @@ export interface RemoteSnapshot {
     /** Phase 1 policy: phone is the default/primary remote microphone. */
     source: "phone";
     defaultSource: "phone";
-    /** Phase 2 turns this on. */
+    /**
+     * True only after the user explicitly turned Phone Remote ON. The server
+     * rejects audio frames until then; nothing enables this automatically.
+     */
+    enabled: boolean;
+    /** True while accepted phone audio is actually reaching Gemini. */
     streaming: boolean;
   };
   error: string | null;
@@ -69,6 +74,7 @@ export class RemoteRuntime {
   private desktopLastSeenAt = 0;
 
   private phone: { id: string; deviceName: string; connectedAt: number } | null = null;
+  private phoneMicEnabled = false;
   private phoneStreaming = false;
   private myraSpeaking = false;
   private lastError: string | null = null;
@@ -146,8 +152,24 @@ export class RemoteRuntime {
       deviceName: session.deviceName,
       connectedAt: this.now(),
     };
+    // A (re)connected phone always starts with Phone Remote OFF. It must be
+    // enabled by an explicit user action on that socket.
+    this.phoneMicEnabled = false;
     this.phoneStreaming = false;
     this.emitIfChanged();
+  }
+
+  /** Explicit manual Phone Remote ON/OFF for the connected phone. */
+  setPhoneMicEnabled(enabled: boolean): void {
+    const next = enabled && this.phone !== null;
+    if (this.phoneMicEnabled === next) return;
+    this.phoneMicEnabled = next;
+    if (!next) this.phoneStreaming = false;
+    this.emitIfChanged();
+  }
+
+  isPhoneMicEnabled(): boolean {
+    return this.phone !== null && this.phoneMicEnabled;
   }
 
   /** Phase 2: true while accepted phone audio is flowing into Gemini. */
@@ -161,6 +183,7 @@ export class RemoteRuntime {
     if (!this.phone) return;
     if (sessionId && this.phone.id !== sessionId) return;
     this.phone = null;
+    this.phoneMicEnabled = false;
     this.phoneStreaming = false;
     this.emitIfChanged();
   }
@@ -201,6 +224,7 @@ export class RemoteRuntime {
       mic: {
         source: "phone",
         defaultSource: "phone",
+        enabled: this.phone !== null && this.phoneMicEnabled,
         streaming: this.phone !== null && this.phoneStreaming,
       },
       error: this.lastError,
@@ -213,6 +237,7 @@ export class RemoteRuntime {
     this.desktopClients.clear();
     this.establishedSessions.clear();
     this.phone = null;
+    this.phoneMicEnabled = false;
     this.phoneStreaming = false;
     this.myraSpeaking = false;
   }

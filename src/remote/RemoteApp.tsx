@@ -41,6 +41,8 @@ interface RemoteSnapshot {
   mic: {
     source: "phone";
     defaultSource: "phone";
+    /** Server-authoritative manual Phone Remote state. */
+    enabled: boolean;
     streaming: boolean;
   };
   error: string | null;
@@ -119,6 +121,8 @@ export default function RemoteApp() {
   const phaseRef = useRef<Phase>("loading");
   const socketRef = useRef<WebSocket | null>(null);
   const captureRef = useRef<PhoneAudioCapture | null>(null);
+  /** Blocks a second microphone session from a rapid double click. */
+  const startingRef = useRef(false);
   const audioSeqRef = useRef(0);
   const audioStatsRef = useRef({ sent: 0, dropped: 0 });
 
@@ -236,8 +240,10 @@ export default function RemoteApp() {
         clearHeartbeat();
         if (socket === ws) socket = null;
         if (socketRef.current === ws) socketRef.current = null;
-        // Phase 2: never leave the phone microphone or AudioContext running
-        // after the authenticated transport goes away.
+        // Never leave the phone microphone or AudioContext running after the
+        // authenticated transport goes away. Phone Remote stays OFF after a
+        // reconnect; it is never re-armed automatically.
+        startingRef.current = false;
         captureRef.current?.stop();
         captureRef.current = null;
         setMicPhase("idle");
@@ -390,7 +396,15 @@ export default function RemoteApp() {
   };
 
   const startMic = async () => {
-    if (micPhase === "starting" || micPhase === "streaming") return;
+    if (startingRef.current || micPhase === "starting" || micPhase === "streaming") return;
+    const socket = socketRef.current;
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      setMicPhase("idle");
+      setMicError("The remote link is not connected. Reconnect, then press Phone Remote ON.");
+      return;
+    }
+
+    startingRef.current = true;
     setMicError(null);
     setAudioNotice(null);
     audioStatsRef.current = { sent: 0, dropped: 0 };
@@ -401,6 +415,10 @@ export default function RemoteApp() {
     const capture = new PhoneAudioCapture();
     captureRef.current = capture;
     try {
+      // Explicit manual arming on the server. No audio frame is accepted
+      // before this; Connect Voice never sends it.
+      socket.send(JSON.stringify({ type: "audioStart" }));
+
       await capture.start((chunk) => {
         const ws = socketRef.current;
         const stats = audioStatsRef.current;
@@ -434,6 +452,13 @@ export default function RemoteApp() {
         capture.stop();
         return;
       }
+      const live = socketRef.current;
+      if (!live || live.readyState !== WebSocket.OPEN) {
+        capture.stop();
+        captureRef.current = null;
+        setMicPhase("idle");
+        return;
+      }
       setMicPhase("streaming");
       if (snapshotRef.current?.myra.state !== "ACTIVE") {
         setAudioNotice(
@@ -443,8 +468,15 @@ export default function RemoteApp() {
     } catch (err: any) {
       capture.stop();
       captureRef.current = null;
+      try {
+        socket.send(JSON.stringify({ type: "audioStop" }));
+      } catch {
+        /* socket may be gone */
+      }
       setMicPhase("error");
       setMicError(describeMicError(err));
+    } finally {
+      startingRef.current = false;
     }
   };
 
@@ -452,6 +484,7 @@ export default function RemoteApp() {
     const capture = captureRef.current;
     captureRef.current = null;
     capture?.stop();
+    startingRef.current = false;
     setMicPhase("idle");
     setAudioStats({ ...audioStatsRef.current });
     const ws = socketRef.current;
@@ -467,6 +500,16 @@ export default function RemoteApp() {
   const myraState = snapshot?.myra.state ?? "INACTIVE";
   const linked = phase === "connected";
   const errorText = linkError || snapshot?.error || null;
+  const phoneRemoteOn = micPhase === "streaming";
+  const phoneRemoteLabel = !linked
+    ? "Disconnected"
+    : micPhase === "streaming"
+      ? "ON · Connected"
+      : micPhase === "starting"
+        ? "Connecting…"
+        : micPhase === "error"
+          ? "Error"
+          : "OFF";
 
   return (
     <div className="min-h-screen w-full bg-slate-950 text-slate-100 radial-bg">
@@ -634,28 +677,32 @@ export default function RemoteApp() {
                 <div className="flex items-start justify-between gap-3">
                   <div className="min-w-0">
                     <p className="font-mono text-[9px] uppercase tracking-[0.22em] text-slate-500">
-                      Phone microphone
+                      Phone Remote
                     </p>
-                    <p className="mt-1 text-sm font-semibold text-white">
-                      {micPhase === "streaming"
-                        ? myraState === "ACTIVE" && snapshot?.myra.speaking
-                          ? "Myra speaking · mic paused"
-                          : "Streaming to Myra"
-                        : micPhase === "starting"
-                          ? "Requesting microphone…"
-                          : micPhase === "error"
-                            ? "Microphone error"
-                            : "Microphone idle"}
+                    <p className="mt-1 flex items-center gap-2 text-sm font-semibold text-white">
+                      <span
+                        className={`h-2 w-2 rounded-full ${
+                          phoneRemoteOn
+                            ? "bg-emerald-400"
+                            : micPhase === "starting"
+                              ? "bg-amber-400 animate-pulse"
+                              : "bg-slate-600"
+                        }`}
+                      />
+                      {phoneRemoteLabel}
                     </p>
                     <p className="mt-1 text-[10px] text-slate-500">
-                      16 kHz mono PCM16 · 100 ms chunks · uplink pauses while Myra
-                      speaks to prevent speaker echo
+                      {phoneRemoteOn && myraState === "ACTIVE" && snapshot?.myra.speaking
+                        ? "Myra is speaking · phone mic briefly paused"
+                        : "Manual only · 16 kHz PCM16 · OFF by default and after every reconnect"}
                     </p>
                   </div>
                   <button
                     type="button"
                     onClick={micPhase === "streaming" || micPhase === "starting" ? stopMic : startMic}
                     disabled={phase !== "connected"}
+                    aria-pressed={phoneRemoteOn}
+                    title="Phone Remote is manual only; it never starts from Connect Voice"
                     className={`flex shrink-0 items-center gap-2 rounded-2xl border px-4 py-3 font-mono text-[10px] font-bold uppercase tracking-wider transition disabled:cursor-not-allowed disabled:opacity-40 ${
                       micPhase === "streaming" || micPhase === "starting"
                         ? "border-red-400/40 bg-red-500/10 text-red-200 hover:bg-red-500/20"
@@ -667,7 +714,11 @@ export default function RemoteApp() {
                     ) : (
                       <Mic className="h-3.5 w-3.5" />
                     )}
-                    {micPhase === "streaming" || micPhase === "starting" ? "Stop mic" : "Start mic"}
+                    {micPhase === "streaming" || micPhase === "starting"
+                      ? "Phone Remote ON"
+                      : linked
+                        ? "Phone Remote OFF"
+                        : "Disconnected"}
                   </button>
                 </div>
 
@@ -726,9 +777,9 @@ export default function RemoteApp() {
                 <StatusCard
                   icon={<Mic className="h-4 w-4" />}
                   label="Mic source"
-                  value="Phone (default)"
+                  value={snapshot?.mic.enabled ? "Phone (manual ON)" : "Phone (OFF)"}
                   tone="info"
-                  detail={snapshot?.mic.streaming ? "Streaming" : "Not streaming yet"}
+                  detail={snapshot?.mic.streaming ? "Streaming" : "Not streaming"}
                 />
                 <StatusCard
                   icon={<Smartphone className="h-4 w-4" />}
@@ -767,6 +818,11 @@ export default function RemoteApp() {
                   <CheckCircle2 className="h-3 w-3 text-emerald-400" />
                   Session is authenticated with an HttpOnly cookie. The desktop token never reaches
                   this phone.
+                </p>
+                <p className="mt-2 text-[10px] leading-relaxed text-slate-500">
+                  Phone Remote starts only when you press it above. Enabling Connect Voice on the PC,
+                  refreshing this page or reconnecting never turns it on: its state is OFF until you
+                  press the button, and OFF again after a disconnect.
                 </p>
               </section>
             </>

@@ -194,6 +194,7 @@ rate and resamples with a linear-interpolation downsampler
 Phone → server:
 
 ```json
+{ "type": "audioStart" }
 { "type": "audio", "data": "<base64 PCM16>", "seq": 42 }
 { "type": "audioStop" }
 ```
@@ -205,6 +206,20 @@ Server → phone:
 { "type": "remoteState", "snapshot": { "mic": { "streaming": true } } }
 { "type": "error", "code": "sessionUnavailable", "message": "..." }
 ```
+
+### Manual Phone Remote lifecycle
+
+Phone Remote is **OFF by default and manual-only**. Nothing enables it except
+an explicit `audioStart` from the user pressing **Phone Remote ON** on that
+socket:
+
+- A new or reconnected phone socket always starts with `mic.enabled: false`.
+- `audio` frames received while it is OFF are rejected with `micNotEnabled`
+  and never reach the sink, so late/queued frames cannot leak into a session.
+- Connect Voice (desktop `/ws`) starting, stopping or reconnecting never sends
+  `audioStart` and never changes the phone's manual state.
+- `audioStop`, socket close, replacement and unpair all set `mic.enabled` and
+  `mic.streaming` to false.
 
 ### Server-side validation
 
@@ -249,8 +264,9 @@ provider closes.
 
 ## What Phase 2 does not do
 
-- No ON/OFF control. `control` frames receive
-  `{"type":"error","code":"notImplemented"}`.
+- No Myra session ON/OFF control. `control` frames receive
+  `{"type":"error","code":"notImplemented"}`. Only the phone microphone has
+  a manual ON/OFF (`audioStart` / `audioStop`).
 - No managed Myra lifecycle. `myra.state` reports `ACTIVE` only when an
   existing legacy desktop Gemini session is established; otherwise `INACTIVE`.
   Phone audio therefore requires the desktop to have an active session.
@@ -286,8 +302,9 @@ them:
 The phone socket uses a 20-second application heartbeat plus WebSocket
 ping/pong. If the link drops, the phone retries with exponential backoff
 (1s, 2s, 4s, 8s, capped at 15s) and retries immediately when the page becomes
-visible again. A revoked session closes with code `4003`; a replaced session
-closes with `4001`. Both are surfaced in the UI.
+visible again. Reconnecting restores only the control channel: Phone Remote
+stays OFF and must be pressed again. A revoked session closes with code `4003`;
+a replaced session closes with `4001`. Both are surfaced in the UI.
 
 ## Endpoints
 

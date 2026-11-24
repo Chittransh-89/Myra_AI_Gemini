@@ -191,6 +191,8 @@ export interface InterviewSession {
   assessments: { questionId: string; assessment: AnswerAssessment }[];
   hintsUsed: number;
   skips: number;
+  /** Gemini text requests consumed by this interview (persisted across restarts). */
+  requestsUsed?: number;
   reportId: string | null;
   createdAt: string;
   updatedAt: string;

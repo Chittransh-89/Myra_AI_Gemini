@@ -96,12 +96,26 @@ are never stored — only transcript text the voice pipeline produces.
 | --- | --- | --- |
 | `MYRA_INTELLIGENCE` | `1` | `0` disables the API and panel |
 | `MYRA_DATA_DIR` | `./.myra-data` | JSON store location |
-| `MYRA_INTELLIGENCE_MODEL` | `gemini-2.5-flash` | Gemini text model for analysis/interviews |
+| `MYRA_INTELLIGENCE_MODEL` | `gemini-3.8-flash` | Gemini text model for analysis/interviews |
 | `MYRA_APPROVED_PROJECTS_FILE` | set by Electron | approved folder roots |
+| `MYRA_INTELLIGENCE_REQUEST_CAP` | `40` | max Gemini requests per analysis run / interview session |
 
 Analysis and question generation use the same `GEMINI_API_KEY` as voice. Without
 a key, import still works (file listing) but analysis/interviews report a clear
 `aiUnavailable` error.
+
+### Quota and request caps
+
+Gemini quota/429 errors (`RESOURCE_EXHAUSTED`, `quota exceeded`, `rate limit`)
+are classified as `quotaExceeded` before any retry: the run stops immediately,
+chunks are never split, and the UI shows *"Gemini quota exceeded (HTTP 429). No
+further requests were sent — please retry later…"*.
+
+Every analysis run and every interview session also has a hard Gemini request
+allowance (`MYRA_INTELLIGENCE_REQUEST_CAP`, default 40). Analysis counts each
+chunk, split and synthesis attempt; interviews persist their counter on the
+session, so the cap survives restarts. Exceeding it returns `requestCapReached`
+and stops the operation instead of sending more requests.
 
 ## API (local only)
 
@@ -124,26 +138,49 @@ POST /api/intelligence/interviews/:id/resume
 POST /api/intelligence/interviews/:id/end
 POST /api/intelligence/interviews/:id/transcript { role, text }
 GET  /api/intelligence/reports/:reportId
+GET  /api/gemini/usage
 ```
+
+### Local Gemini usage counter
+
+Every Gemini Live session and every `generateContent` request appends one line
+to `gemini-usage.jsonl` in `MYRA_DATA_DIR` (no prompts or responses are stored,
+only time, kind, model and feature). `GET /api/gemini/usage` returns the total,
+the live/generate split and per-feature/per-model counts. Like the intelligence
+API it is loopback-only outside Electron and requires the desktop token in
+Electron mode; responses are `no-store`.
 
 ## Voice integration
 
 `connectSession()` in `src/App.tsx` appends `&interview=<id>` to the existing
 `/ws` URL. The server resolves the interview, appends an interviewer instruction
 to Myra's normal system instruction, and enables Gemini Live input/output
-transcription (`GeminiProvider`). Transcript segments are mirrored to the UI and
-persisted server-side by `IntelligenceService.recordTranscript`. A bad or ended
-interview id silently falls back to the normal assistant, so the voice path can
-never be broken by this feature.
+transcription (`GeminiProvider`). A bad or ended interview id silently falls
+back to the normal assistant, so the voice path can never be broken by this
+feature.
+
+The **backend Interview Engine stays authoritative** in voice mode too:
+
+- The engine generates and stores every question (from the project evidence,
+  the session stage and the previous answer). The Live model is only a voice
+  interface: it reads the exact question it is given and then stays silent.
+- Model speech is never written into the session. Only the candidate's
+  transcription is buffered; after a short silence the server evaluates it with
+  the same `submitAnswer()` the text panel uses, stores the assessment, and
+  decides cross-questioning vs. advancing.
+- The next engine question is sent to the SAME Gemini Live session with
+  `sendText()` (`QUESTION_FROM_ENGINE:`), so questions, transcript,
+  cross-questioning and the final report all come from one stored session
+  record — identical to text mode.
 
 ## Known limitations
 
 - Public GitHub repositories only; no OAuth/PAT, no submodules, no LFS.
 - Very large repositories are sampled (highest-value files first); the profile
   says what was excluded.
-- Questions in voice mode are produced by the live model, guided by the same
-  knowledge profile; the text panel's question list reflects text-mode turns,
-  while the report is built from the full transcript.
+- Voice answer capture depends on Gemini Live input transcription and a
+  ~1.4 s silence window; if transcription is unavailable the answer is not
+  evaluated, and the candidate can still type it in the panel.
 - Analysis quality depends on the Gemini text model; a failed JSON response is
   reported to the user rather than guessed.
 - No live progress percentage during analysis (the panel shows a status line);

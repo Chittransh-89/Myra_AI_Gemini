@@ -7,11 +7,15 @@
  */
 
 import type { ServerConfig } from "../config.js";
+import type { GeminiUsageTracker } from "../geminiUsage.js";
 import type { AIProvider } from "./types.js";
 import { GeminiProvider } from "./gemini.js";
 import { LocalProvider } from "./local.js";
 
-export async function createProvider(config: ServerConfig): Promise<AIProvider> {
+export async function createProvider(
+  config: ServerConfig,
+  usage?: GeminiUsageTracker
+): Promise<AIProvider> {
   let provider: AIProvider;
 
   switch (config.aiProvider) {
@@ -22,7 +26,7 @@ export async function createProvider(config: ServerConfig): Promise<AIProvider> 
             "Add it to your .env file and restart the server."
         );
       }
-      provider = new GeminiProvider(config.geminiApiKey);
+      provider = new GeminiProvider(config.geminiApiKey, usage);
       break;
     }
 
